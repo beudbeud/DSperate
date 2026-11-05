@@ -595,6 +595,12 @@ bool NDS::save_state(state::Writer& w, std::string& err) {
   return true;
 }
 
+size_t NDS::state_size_max(std::string& err) {
+  state::Writer w;
+  if (!save_state(w, err)) return 0;
+  return w.data().size() + gpu::Gpu3D::state_lists_max();
+}
+
 bool NDS::load_state(state::Reader& r, std::string& err) {
   char magic[4]; r.blob_raw(magic, 4);
   u32 version = 0; r.blob_raw(&version, 4);

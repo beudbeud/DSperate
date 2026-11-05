@@ -1461,6 +1461,15 @@ template <class S> void Gpu3D::sync_state(S& s) {
   stack_err_ = gxstat_ & 0x8000u; box_result_ = gxstat_ & 2u; gxstat_ &= ~0x8002u;
 }
 template void Gpu3D::sync_state<state::Writer>(state::Writer&);
+size_t Gpu3D::state_lists_max() {
+  state::Writer w;
+  w.data().reserve(1024);   // GCC's -Wstringop-overflow misreads the first insert into an empty vector here
+  Vertex v{}; sync_vertex(w, v);
+  const size_t vb = w.data().size();
+  Polygon p{}; sync_polygon(w, p);
+  const size_t pb = w.data().size() - vb;
+  return 32 * sizeof(u32) + PRAM_BANK * sizeof(u16) + 2 * (VRAM_BANK * vb + PRAM_BANK * pb);
+}
 template void Gpu3D::sync_state<state::Reader>(state::Reader&);
 
 } // namespace ds::gpu

@@ -88,6 +88,9 @@ public:
   ~Gpu3D();
   void reset();
   template <class S> void sync_state(S& s);   // after sync_raster()
+  // The most the GX3D chunk's lists can take: in-flight parameters, the render
+  // list, and both saved banks of vertex and polygon RAM full.
+  static size_t state_lists_max();
 
   // Registers: DISP3DCNT (0x60), the 0x320-0x3BF block, the FIFO/command
   // ports and status/results at 0x400-0x6A3.

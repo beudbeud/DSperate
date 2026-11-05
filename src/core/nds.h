@@ -170,6 +170,10 @@ struct NDS {
   // machine unusable (reset it). `err` gets the reason on failure.
   bool save_state(state::Writer& w, std::string& err);
   bool load_state(state::Reader& r, std::string& err);
+  // A size no save state of this session exceeds (a DSi NAND's changes aside):
+  // the state now, plus the 3D lists at their hardware maximum. 0 with `err`
+  // when no state can be taken here.
+  size_t state_size_max(std::string& err);
   // Set by a DSi load_state without the state's SD card (folder changed, or
   // this session has none); empty otherwise. Frontends surface it.
   std::string sd_card_note;
