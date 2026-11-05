@@ -51,6 +51,7 @@ public:
   const u32* frame_ready(u64 gen, bool allow_lag) override;
   const u8* edges_for(const u32* out) const override;
   bool has_frame() const override;
+  void forget() override;
   u64 gpu_ns() const override;
   u32 draws() const override;
   Stats stats(bool reset) override;

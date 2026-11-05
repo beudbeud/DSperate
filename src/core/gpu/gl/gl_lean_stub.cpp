@@ -20,6 +20,7 @@ const u32* Lean::output() { return nullptr; }
 const u32* Lean::frame_ready(u64, bool) { return nullptr; }
 const u8* Lean::edges_for(const u32*) const { return nullptr; }
 bool Lean::has_frame() const { return false; }
+void Lean::forget() {}
 u64 Lean::gpu_ns() const { return 0; }
 u32 Lean::draws() const { return 0; }
 Lean::Stats Lean::stats(bool) { return {}; }
