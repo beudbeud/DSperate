@@ -205,8 +205,34 @@ Cross builds: `aarch64-cross` (needs `aarch64-linux-gnu-g++`) and
 AArch64 and ARMv7 hosts; elsewhere you get the interpreter and the portable
 renderer.
 
+### libretro core (RetroArch, Raspberry Pi 5)
+
+    cmake -S . -B build/libretro -G Ninja -DDSPERATE_LIBRETRO=ON -DDSPERATE_SDL=OFF -DDSPERATE_HEADLESS=OFF
+    cmake --build build/libretro --target dsperate_libretro
+    cp build/libretro/src/frontend/libretro/dsperate_libretro.so ~/.config/retroarch/cores/
+
+`dsperate_libretro.so` runs a `.nds` or `.zip` by direct boot, with
+`bios9.bin`/`bios7.bin`/`firmware.bin` from RetroArch's system directory (or
+its `nds/` subfolder, as Recalbox lays it out) when present and the built-in FreeBIOS otherwise. Battery saves go to the save
+directory as `<rom>.sav`, save states and rewind work, and the pointer (touch
+screen or mouse) drives the stylus on the bottom screen; L3 toggles the lid.
+Core options: screen layout, gap and swap; GPU 3D (Vulkan, or OpenGL ES 3.1
+on the Pi 5's V3D driver: the raster opens its own EGL context, so no
+RetroArch hardware context is involved) and which of the two to use; 3D
+anti-aliasing; frameskip; the
+recompiler; direct or firmware boot; DS or DSi console (DSiWare runs with the
+DSi BIOS pair in the system directory, no NAND); firmware language; the
+built-in analog (CPAD) patches on the sticks; a stick-driven stylus (R3
+taps); the host microphone or noise on a trigger; the Rumble Pak on the
+controller's motor. RetroArch's own cheats (Action Replay words) and
+achievements (main RAM is exposed) work. Build it on the device, or
+cross-compile with the `aarch64-cross` toolchain file; the JIT and NEON
+kernels are in. On a 16 KB page kernel (the Pi 5 images) fastmem is declined
+and the recompiler keeps its page-table path; that costs about a quarter of a
+millisecond per frame.
+
 CMake switches: `DSPERATE_JIT`, `DSPERATE_NEON`, `DSPERATE_TESTS`,
-`DSPERATE_HEADLESS`, `DSPERATE_SDL`, `DSPERATE_WAYLAND`, `DSPERATE_CHEEVOS`,
+`DSPERATE_HEADLESS`, `DSPERATE_SDL`, `DSPERATE_LIBRETRO`, `DSPERATE_WAYLAND`, `DSPERATE_CHEEVOS`,
 `DSPERATE_NET`, `DSPERATE_HARDEN`, `DSPERATE_TUNE` (extra `-mcpu`/`-mtune`
 flags, e.g. `-mcpu=cortex-a55`), and `DSPERATE_PGO=generate|use` (profiles for
 AArch64 and ARMv7 are committed under [pgo/](pgo/)).

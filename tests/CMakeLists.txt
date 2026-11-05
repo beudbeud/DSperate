@@ -198,3 +198,9 @@ if(DSPERATE_VULKAN AND DSPERATE_VULKAN_INCLUDE AND SDL2_FOUND AND CMAKE_SYSTEM_N
   target_include_directories(gpu_present_probe PRIVATE ${DSPERATE_VULKAN_INCLUDE} ${SDL2_INCLUDE_DIRS} ${PROJECT_SOURCE_DIR})
   target_compile_definitions(gpu_present_probe PRIVATE DSPERATE_PRESENT_SHADER_DIR="${PROJECT_SOURCE_DIR}/src/frontend/sdl/shaders")
 endif()
+
+if(DSPERATE_LIBRETRO)
+  add_executable(test_libretro libretro_test.cpp)
+  target_link_libraries(test_libretro PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME libretro COMMAND test_libretro $<TARGET_FILE:dsperate_libretro>)
+endif()
