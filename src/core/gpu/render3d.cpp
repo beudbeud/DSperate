@@ -3596,7 +3596,7 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst, u32* edst) {
 
 template <class S> void Renderer3D::sync_output(S& s) {
   sync_all();
-  if constexpr (S::reading) { reset(); texcache_.clear(); }
+  if constexpr (S::reading) { reset(); texcache_.clear(); gpu_frame_ = false; if (lean_) lean_->forget(); }
   if constexpr (!S::reading) { if (gpu_frame_ && lean_) { gpu_job_wait(); if (const u32* g = lean_->newest_ready(false)) std::memcpy(out_[display_].data(), g, sizeof(u32) * 256 * 192); } }
   s.begin("R3DO");
   s.fields(rendered_once_, out_[display_]);   // reset() above leaves display_ at 0 on a load

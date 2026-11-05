@@ -24,6 +24,7 @@ void Lean::wait_all() {}
 const u32* Lean::output() { return nullptr; }
 const u32* Lean::frame_ready(u64, bool) { return nullptr; }
 bool Lean::has_frame() const { return false; }
+void Lean::forget() {}
 u64 Lean::gpu_ns() const { return 0; }
 u32 Lean::draws() const { return 0; }
 Lean::Stats Lean::stats(bool) { return {}; }
@@ -824,6 +825,13 @@ void Lean::wait_all() {
   d.tex_flushed = 0;
 }
 
+void Lean::forget() {
+  wait_all();
+  Impl& d = *d_;
+  std::lock_guard<std::mutex> lk(d.m);
+  for (bool& v : d.valid) v = false;
+}
+
 // Slot `slot` finished (seen signalled, no wait): make it readable.
 static void poll_slot(Lean::Impl& d, u32 slot) {
   if (d.fence_live[slot] && d.api->vkGetFenceStatus(d.vk->dev, d.fence[slot]) == VK_SUCCESS) finish_slot(d, slot);
@@ -839,6 +847,7 @@ const u32* Lean::frame_ready(u64 want, bool allow_lag) {
   if (want > d.gen) {
     if (!allow_lag || no_lag) return nullptr;
     const u32 newest = static_cast<u32>((d.gen - 1) % Impl::kSlots);
+    if (!d.fence_live[newest] && !d.valid[newest]) return nullptr;   // forgotten: the caller waits for the submit
     if (d.fence_live[newest]) { d.api->vkWaitForFences(d.vk->dev, 1, &d.fence[newest], VK_TRUE, ~0ull); d.st.lat_ms += now_ms() - d.submit_at[newest]; ++d.st.lat_n; finish_slot(d, newest); }
     ++d.st.lagged; return static_cast<const u32*>(d.out[newest].ptr);
   }

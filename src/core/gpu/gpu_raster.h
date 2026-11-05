@@ -68,6 +68,9 @@ public:
   // pixel's colour is the record's); null without edges.
   virtual const u8* edges_for(const u32* out) const = 0;
   virtual bool has_frame() const = 0;
+  // A save state was loaded: every finished frame belongs to the session it
+  // replaced, so none may serve the lag rule again.
+  virtual void forget() = 0;
 
   // GPU time of the last waited frame in ns (DS_VK_TIMING=1 and timestamps), else 0.
   virtual u64 gpu_ns() const = 0;

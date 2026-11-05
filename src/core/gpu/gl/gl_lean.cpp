@@ -759,6 +759,13 @@ void Lean::wait_all() {
   d.cv.wait(lk, [&d] { return d.collected == d.gen; });
 }
 
+void Lean::forget() {
+  Impl& d = *d_;
+  std::unique_lock<std::mutex> lk(d.m);
+  d.cv.wait(lk, [&d] { return d.collected == d.gen; });
+  for (bool& v : d.valid) v = false;
+}
+
 const u32* Lean::frame_ready(u64 want, bool allow_lag) {
   Impl& d = *d_;
   std::unique_lock<std::mutex> lk(d.m);
@@ -769,6 +776,7 @@ const u32* Lean::frame_ready(u64 want, bool allow_lag) {
   if (want > d.gen) {
     if (!allow_lag || no_lag) return nullptr;
     const u32 newest = static_cast<u32>((d.gen - 1) % Impl::kSlots);
+    if (!d.live[newest] && !d.valid[newest]) return nullptr;   // forgotten: the caller waits for the submit
     wait_slot(d, lk, newest);
     ++d.st.lagged; return d.out_host[newest].data();
   }
