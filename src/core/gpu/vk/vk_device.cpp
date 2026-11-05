@@ -80,18 +80,21 @@ struct Device::Impl {
   // a preference (costs nothing on unified parts; a discrete dev card's
   // cached host-visible type may be system memory) so it's tried first, and
   // falling back is reported via Device::name() rather than silent.
-  bool find_mem(u32 bits, Access a, u32* out, bool* was_device_local = nullptr) const {
-    const VkMemoryPropertyFlags need =
-      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-      (a == Access::CpuRead ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT
-                            : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    for (int pass = 0; pass < 2; ++pass) {
+  // CpuRead wants a cached mapping; a driver with none (v3dv on the Pi 5
+  // has only coherent types) still works, with slower reads of the layer.
+  bool find_mem(u32 bits, Access a, u32* out, bool* was_device_local = nullptr, bool* cached = nullptr) const {
+    const int passes = a == Access::CpuRead ? 4 : 2;
+    for (int pass = 0; pass < passes; ++pass) {
+      const bool want_cached = a == Access::CpuRead && pass < 2;
       const VkMemoryPropertyFlags want =
-        need | (pass == 0 ? VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT} : 0u);
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        (want_cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) |
+        (pass % 2 == 0 ? VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT} : 0u);
       for (u32 i = 0; i < memprops.memoryTypeCount; ++i)
         if ((bits & (1u << i)) && (memprops.memoryTypes[i].propertyFlags & want) == want) {
           *out = i;
-          if (was_device_local) *was_device_local = pass == 0;
+          if (was_device_local) *was_device_local = pass % 2 == 0;
+          if (cached) *cached = (memprops.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0;
           return true;
         }
     }
@@ -315,9 +318,10 @@ std::unique_ptr<Device> Device::create(std::string* why) {
   d.api.vkGetDeviceQueue(d.dev, d.qfam, 0, &d.queue);
   if (nqueues > 1) { d.api.vkGetDeviceQueue(d.dev, d.qfam, 1, &d.queue2); self->name_ += " (2 queues)"; }
 
-  u32 dummy = 0;
-  if (!d.find_mem(~0u, Access::CpuRead, &dummy, &d.device_local)) return set("no HOST_CACHED memory type");
+  u32 dummy = 0; bool cached = false;
+  if (!d.find_mem(~0u, Access::CpuRead, &dummy, &d.device_local, &cached)) return set("no host-visible memory type");
   if (!d.device_local) self->name_ += " (host memory, not device-local: a development fallback)";
+  if (!cached) self->name_ += " (uncached readback)";
   if (!self->limits_.int64_atomics) self->name_ += " (no 64-bit atomics: the visibility pass is off)";
 
   d.internal.api = &d.api;
