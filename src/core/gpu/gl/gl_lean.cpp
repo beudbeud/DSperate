@@ -240,10 +240,20 @@ std::unique_ptr<Lean> Lean::create(bool aa, bool edges, std::string* why) {
   // EGL: the default display, an ES 3.1 context on no surface (a 1x1
   // pbuffer where the driver wants one). The display is initialised once
   // and never terminated: the frontend may share it.
-  d.dpy = a.eglGetDisplay(EGL_DEFAULT_DISPLAY);
-  if (!d.dpy) return fail("eglGetDisplay failed");
+  // Mesa's surfaceless platform first (the render node, no window system:
+  // what a headless run, a KMS frontend or a libretro host has), then the
+  // default display.
   EGLint maj = 0, min = 0;
-  if (!a.eglInitialize(d.dpy, &maj, &min)) return fail("eglInitialize failed");
+  d.dpy = nullptr;
+  if (a.eglGetPlatformDisplayEXT && has_egl_ext(a.eglQueryString(nullptr /* EGL_NO_DISPLAY */, EGL_EXTENSIONS), "EGL_MESA_platform_surfaceless")) {
+    d.dpy = a.eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
+    if (d.dpy && !a.eglInitialize(d.dpy, &maj, &min)) d.dpy = nullptr;
+  }
+  if (!d.dpy) {
+    d.dpy = a.eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (!d.dpy) return fail("eglGetDisplay failed");
+    if (!a.eglInitialize(d.dpy, &maj, &min)) return fail("eglInitialize failed");
+  }
   const char* egl_exts = a.eglQueryString(d.dpy, EGL_EXTENSIONS);
   a.eglBindAPI(EGL_OPENGL_ES_API);
   const EGLint cfg_attrs[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_RED_SIZE, 8, EGL_NONE};

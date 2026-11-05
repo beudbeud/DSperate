@@ -54,6 +54,7 @@ bool Api::load(std::string* why) {
   R(glDrawArrays); R(glDrawArraysInstanced); R(glGenVertexArrays); R(glDeleteVertexArrays); R(glBindVertexArray); R(glFlush); R(glFinish); R(glMemoryBarrier);
   R(glGenQueriesEXT); R(glDeleteQueriesEXT); R(glBeginQueryEXT); R(glEndQueryEXT); R(glGetQueryObjectuivEXT); R(glGetQueryObjectui64vEXT);
 #undef R
+  resolve2(eglGetPlatformDisplayEXT, "eglGetPlatformDisplay", "eglGetPlatformDisplayEXT", gpa);
   resolve2(glBufferStorageEXT, "glBufferStorageEXT", "glBufferStorage", gpa);
   resolve2(glColorMaski, "glColorMaski", "glColorMaskiEXT", gpa); if (!glColorMaski) resolve(glColorMaski, "glColorMaskiOES", gpa);
   resolve2(glEnablei, "glEnablei", "glEnableiEXT", gpa); if (!glEnablei) resolve(glEnablei, "glEnableiOES", gpa);
