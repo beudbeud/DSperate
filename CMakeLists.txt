@@ -19,6 +19,7 @@ option(DSPERATE_SDL      "Build the SDL2 frontend (off when SDL2 is not found)" 
 option(DSPERATE_WAYLAND  "Build the Wayland dmabuf scanout tier (off when SDL2 has no Wayland)" ON)
 option(DSPERATE_CHEEVOS  "Build RetroAchievements support"                  ON)
 option(DSPERATE_NET      "Build the Wi-Fi transports (local wireless over the LAN)" ON)
+option(DSPERATE_LIBRETRO "Build the libretro core (dsperate_libretro.so; makes every object PIC)" OFF)
 
 # JIT and NEON kernels are gated separately: an ARMv7 host gets NEON kernels
 # with its own JIT backend, a non-ARM host gets neither.
@@ -132,6 +133,11 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
+# A shared core needs the static libraries it links built as PIC.
+if(DSPERATE_LIBRETRO)
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 add_subdirectory(src/core)
 add_subdirectory(src/frontend/video)
 add_subdirectory(src/frontend/i18n)
@@ -143,6 +149,9 @@ if(DSPERATE_NET)
 endif()
 if(DSPERATE_HEADLESS)
   add_subdirectory(src/frontend/headless)
+endif()
+if(DSPERATE_LIBRETRO)
+  add_subdirectory(src/frontend/libretro)
 endif()
 if(DSPERATE_SDL)
   find_package(PkgConfig QUIET)
