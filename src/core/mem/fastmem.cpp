@@ -98,6 +98,10 @@ u8* HostArena::take(size_t bytes) {
 }
 
 std::unique_ptr<GuestView> GuestView::create(const HostArena& arena, const PageTable& table) {
+  // The view is laid in 4 KB host pages; a 16 KB-page kernel (Raspberry Pi
+  // 5 images) can't map them, so every lay_run would fail. No view, and the
+  // recompiler keeps the page-table path.
+  if (sysconf(_SC_PAGESIZE) != static_cast<long>(HOST_PAGE)) return nullptr;
   std::unique_ptr<GuestView> v(new GuestView(arena, table));
   void* p = mmap(nullptr, static_cast<size_t>(RESERVE), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (p == MAP_FAILED) return nullptr;
