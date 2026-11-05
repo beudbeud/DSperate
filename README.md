@@ -221,9 +221,12 @@ renderer.
 `dsperate_libretro.so` runs a `.nds` or `.zip` by direct boot, with
 `bios9.bin`/`bios7.bin`/`firmware.bin` from RetroArch's system directory (or
 its `nds/` subfolder, as Recalbox lays it out) when present and the built-in FreeBIOS otherwise. Battery saves go to the save
-directory as `<rom>.sav`, save states and rewind work, and the pointer (touch
-screen or mouse) drives the stylus on the bottom screen; L3 toggles the lid.
-Core options: screen layout, gap and swap; GPU 3D (Vulkan, or OpenGL ES 3.1
+directory as `<rom>.sav`, and the pointer (touch screen or mouse) drives the
+stylus on the bottom screen; L3 toggles the lid. Save states have one size
+for the session, so rewind and run-ahead work.
+Core options: screen layout (vertical, horizontal, hybrid with a large and
+a small screen for a TV, picture in picture, one screen), gap, swap, and a
+button that swaps the screens in game; GPU 3D (Vulkan, or OpenGL ES 3.1
 on the Pi 5's V3D driver: the raster opens its own EGL context, so no
 RetroArch hardware context is involved) and which of the two to use; 3D
 anti-aliasing; frameskip; the
