@@ -13,6 +13,7 @@
 #include "core/input/input_log.h"
 #include "core/io/dsi_title_install.h"
 #include "core/state/state.h"
+#include "frontend/video/layout.h"
 #if DSPERATE_JIT
 #include "core/cpu/jit/jit.h"
 #endif
@@ -52,6 +53,10 @@ std::string save_path;          // <saves>/<rom>.sav, as the SDL frontend names 
 u32 save_writes_seen = 0;       // cart->sram_writes() when the file last matched the chip
 int save_quiet_frames = 0;      // frames since the chip last changed
 std::vector<u32> frame;         // the laid-out output frame
+state::Writer state_w;          // reused: a state is several MB and RetroArch may take one every frame
+size_t state_max = 0;           // the size every state of this session is given (retro_serialize_size)
+std::vector<s16> carry;         // samples a save's SPU catch-up mixed ahead of the next frame (stereo)
+constexpr size_t CARRY_MAX = 4096;   // frames; a catch-up at a frame boundary mixes a few dozen at most
 std::vector<cheat::Code> analog_codes;   // the game's CPAD patch from the built-in database
 std::vector<cheat::Code> user_codes;     // retro_cheat_set, by index
 u32 rumble_seen = 0; int rumble_frames = 0;
@@ -59,8 +64,15 @@ u64 noise = 0x9E3779B97F4A7C15ull;       // fake mic xorshift state
 float cursor_x = SCREEN_W / 2.0f, cursor_y = SCREEN_H / 2.0f;   // stick-driven stylus
 
 // Options, read by apply_vars.
-enum Layout { Vertical, Horizontal, Top, Bottom } layout = Vertical;
-u32 gap = 0; bool swap_screens = false;
+frontend::Layout lay;           // the shared layout arithmetic (frontend/video/layout.h)
+int lay_scale = 1;              // output pixels per DS pixel
+int lay_first = 0;              // the screen the layout option puts first (top, left, large or alone)
+bool swap_screens = false;      // the option
+bool swapped = false;           // toggled in game by the swap button
+unsigned swap_button = RETRO_DEVICE_ID_JOYPAD_R3; bool swap_button_on = true, swap_button_was = false;
+u32 out_w = SCREEN_W, out_h = SCREEN_H * 2;
+frontend::View views[frontend::SCREENS];
+std::vector<u16> source_x[frontend::SCREENS];   // per view: the DS column each output column shows
 bool gpu3d = false, aa = false; int frameskip = 0;
 enum TouchStick { NoStick, Right, Left } touch_stick = NoStick;
 enum Mic { NoMic, HostMic, NoiseL2, NoiseR2 } mic_mode = NoMic;
@@ -79,11 +91,13 @@ retro_core_option_v2_category CATS[] = {
 #define ON_OFF {"disabled", "Off"}, {"enabled", "On"}
 retro_core_option_v2_definition DEFS[] = {
   {"dsperate_layout", "Video > Screen layout", "Screen layout", "How the two DS screens are arranged in the frame.", nullptr, "video",
-   {{"vertical", "Vertical"}, {"horizontal", "Horizontal"}, {"top", "Top screen only"}, {"bottom", "Bottom screen only"}, {nullptr, nullptr}}, "vertical"},
-  {"dsperate_screen_gap", "Video > Screen gap", "Screen gap", "Pixels between the two screens in the vertical and horizontal layouts.", nullptr, "video",
+   {{"vertical", "Vertical"}, {"horizontal", "Horizontal"}, {"hybrid", "Hybrid (large + small, for a TV)"}, {"pip", "Picture in picture"}, {"top", "Top screen only"}, {"bottom", "Bottom screen only"}, {nullptr, nullptr}}, "vertical"},
+  {"dsperate_screen_gap", "Video > Screen gap", "Screen gap", "Pixels between the two screens in the vertical, horizontal and hybrid layouts.", nullptr, "video",
    {{"0", nullptr}, {"8", nullptr}, {"16", nullptr}, {"32", nullptr}, {"64", nullptr}, {"90", "90 (hinge)"}, {nullptr, nullptr}}, "0"},
-  {"dsperate_swap_screens", "Video > Swap screens", "Swap screens", "Draw the bottom screen first (top or left). Touch follows the bottom screen wherever it is.", nullptr, "video",
+  {"dsperate_swap_screens", "Video > Swap screens", "Swap screens", "Put the bottom screen first: on top, on the left, large, or alone. Touch follows the bottom screen wherever it is.", nullptr, "video",
    {ON_OFF, {nullptr, nullptr}}, "disabled"},
+  {"dsperate_swap_button", "Video > Swap screens button", "Swap screens button", "A button that swaps the screens in game. R3 taps the stylus instead while the stylus is on a stick.", nullptr, "video",
+   {{"r3", "R3"}, {"l2", "L2"}, {"r2", "R2"}, {"disabled", "Off"}, {nullptr, nullptr}}, "r3"},
   {"dsperate_gpu3d", "Video > GPU 3D", "GPU 3D", "Draw the 3D layer on the GPU: Vulkan, else OpenGL ES 3.1 (the Pi 5's V3D). The software rasteriser is the exact reference; falls back to it when no driver works.", nullptr, "video",
    {ON_OFF, {nullptr, nullptr}}, "disabled"},
   {"dsperate_gpu3d_api", "Video > GPU 3D backend", "GPU 3D backend", "Auto tries Vulkan then OpenGL ES. Vulkan has 4x MSAA anti-aliasing; OpenGL ES has none.", nullptr, "video",
@@ -138,7 +152,7 @@ const retro_input_descriptor DESCS[] = {
   {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L, "L"}, {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R, "R"},
   {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start"}, {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT, "Select"},
   {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2, "ZL (analog patch) / mic noise"}, {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2, "ZR (analog patch) / mic noise"},
-  {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3, "Close/open lid"}, {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3, "Stylus tap (stick stylus)"},
+  {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3, "Close/open lid"}, {0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3, "Swap screens / stylus tap (stick stylus)"},
   {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X, "Circle Pad X / stylus"}, {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y, "Circle Pad Y / stylus"},
   {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X, "C-Stick X / stylus"}, {0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y, "C-Stick Y / stylus"},
   {0, 0, 0, 0, nullptr},
@@ -149,24 +163,26 @@ std::string var(const char* key) {
   return env_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &v) && v.value ? v.value : "";
 }
 
-void frame_size(u32& w, u32& h) {
-  w = layout == Horizontal ? SCREEN_W * 2 + gap : SCREEN_W;
-  h = layout == Vertical ? SCREEN_H * 2 + gap : SCREEN_H;
-}
+bool drawn(const frontend::View& v) { return v.direct || v.shown; }
 
-// Where DS screen `s` (0 top, 1 bottom) sits in the output frame; false when it's not shown.
-bool screen_origin(int s, u32& x, u32& y) {
-  x = y = 0;
-  if (layout == Top) return s == 0;
-  if (layout == Bottom) return s == 1;
-  const int slot = swap_screens ? 1 - s : s;   // 0 first (top/left), 1 second
-  if (slot) { if (layout == Horizontal) x = SCREEN_W + gap; else y = SCREEN_H + gap; }
-  return true;
+// Places the screens for the current options and swap, and sizes the frame.
+void relayout() {
+  lay.primary = lay_first ^ (swap_screens != swapped ? 1 : 0);
+  int w, h;
+  frontend::natural_size(lay, lay_scale, w, h);
+  out_w = static_cast<u32>(w); out_h = static_cast<u32>(h);
+  frontend::place(lay, w, h, views);
+  for (int i = 0; i < frontend::SCREENS; ++i) {
+    const frontend::Rect& r = views[i].rect;
+    source_x[i].resize(static_cast<size_t>(std::max(0, r.w)));
+    for (int x = 0; x < r.w; ++x) source_x[i][static_cast<size_t>(x)] = static_cast<u16>(x * static_cast<int>(SCREEN_W) / r.w);
+  }
+  frame.assign(static_cast<size_t>(w) * h, 0xFF000000u);
 }
 
 retro_game_geometry geometry() {
-  u32 w, h; frame_size(w, h);
-  return {w, h, SCREEN_W * 2 + 90, SCREEN_H * 2 + 90, static_cast<float>(w) / static_cast<float>(h)};
+  // The largest any layout gets: hybrid at 2x with a 90-pixel gap, vertical with one.
+  return {out_w, out_h, SCREEN_W * 3 + 90, SCREEN_H * 2 + 90, static_cast<float>(out_w) / static_cast<float>(out_h)};
 }
 
 bool open_mic() {
@@ -187,14 +203,23 @@ void close_mic() {
 
 void apply_vars(bool at_load) {
   const std::string l = var("dsperate_layout");
-  const Layout nl = l == "horizontal" ? Horizontal : l == "top" ? Top : l == "bottom" ? Bottom : Vertical;
-  const u32 ng = static_cast<u32>(std::atoi(var("dsperate_screen_gap").c_str()));
+  frontend::Layout nl;
+  nl.mode = l == "horizontal" ? frontend::Mode::Horizontal : l == "hybrid" ? frontend::Mode::DominantH
+          : l == "pip" ? frontend::Mode::Pip : l == "top" || l == "bottom" ? frontend::Mode::Single : frontend::Mode::Vertical;
+  nl.dominant_auto = false;   // hybrid: the small screen half the large one
+  nl.gap = std::atoi(var("dsperate_screen_gap").c_str());
+  const int scale = nl.mode == frontend::Mode::DominantH || nl.mode == frontend::Mode::Pip ? 2 : 1;
+  const int first = l == "bottom" ? 1 : 0;
   const bool ns = var("dsperate_swap_screens") == "enabled";
-  if (nl != layout || ng != gap || ns != swap_screens || at_load) {
-    layout = nl; gap = ng; swap_screens = ns;
-    u32 w, h; frame_size(w, h); frame.assign(static_cast<size_t>(w) * h, 0xFF000000u);
-    if (!at_load) { retro_game_geometry g = geometry(); env_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &g); }
+  if (nl.mode != lay.mode || nl.gap != lay.gap || scale != lay_scale || first != lay_first || ns != swap_screens || at_load) {
+    const u32 ow = out_w, oh = out_h;
+    lay = nl; lay_scale = scale; lay_first = first; swap_screens = ns;
+    relayout();
+    if (!at_load && (ow != out_w || oh != out_h)) { retro_game_geometry g = geometry(); env_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &g); }
   }
+  const std::string sb = var("dsperate_swap_button");
+  swap_button_on = sb != "disabled";
+  swap_button = sb == "l2" ? RETRO_DEVICE_ID_JOYPAD_L2 : sb == "r2" ? RETRO_DEVICE_ID_JOYPAD_R2 : RETRO_DEVICE_ID_JOYPAD_R3;
   const bool g = var("dsperate_gpu3d") == "enabled";
   // The backend pick goes through the raster's own knob (gpu/gpu_raster.cpp reads DS_GPU3D_API).
   const std::string api = var("dsperate_gpu3d_api");
@@ -245,11 +270,48 @@ std::string dir_env(unsigned cmd) {
   return env_cb(cmd, &d) && d ? d : "";
 }
 
-void blit(int screen, u32 x0, u32 y0) {
-  u32 w, h; frame_size(w, h);
-  const u32* src = nds->gpu.framebuffer(screen);
-  for (u32 y = 0; y < SCREEN_H; ++y) std::memcpy(&frame[(y0 + y) * w + x0], src + y * SCREEN_W, SCREEN_W * 4);
+// Screen `v.screen` into its rect, nearest-neighbour when the rect is not 1x.
+void blit(const frontend::View& v, const std::vector<u16>& sx) {
+  const u32* src = nds->gpu.framebuffer(v.screen);
+  const frontend::Rect& r = v.rect;
+  for (int y = std::max(0, r.y); y < std::min<int>(out_h, r.y + r.h); ++y) {
+    const u32* row = src + static_cast<size_t>((y - r.y) * static_cast<int>(SCREEN_H) / r.h) * SCREEN_W;
+    u32* dst = &frame[static_cast<size_t>(y) * out_w];
+    const int x0 = std::max(0, r.x), x1 = std::min<int>(out_w, r.x + r.w);
+    if (r.w == static_cast<int>(SCREEN_W)) { std::memcpy(dst + x0, row + (x0 - r.x), static_cast<size_t>(x1 - x0) * 4); continue; }
+    for (int x = x0; x < x1; ++x) dst[x] = row[sx[static_cast<size_t>(x - r.x)]];
+  }
 }
+
+// The frontend's pointer, in output pixels, as a touch: on the bottom screen
+// when that is what is drawn there (an inset on top wins).
+bool pointer_touch(int px, int py, u8& x, u8& y) {
+  for (int i = frontend::SCREENS - 1; i >= 0; --i) {
+    const frontend::View& v = views[i];
+    const frontend::Rect& r = v.rect;
+    if (!drawn(v) || px < r.x || py < r.y || px >= r.x + r.w || py >= r.y + r.h) continue;
+    if (v.screen != 1) return false;
+    x = static_cast<u8>((px - r.x) * static_cast<int>(SCREEN_W) / r.w);
+    y = static_cast<u8>((py - r.y) * static_cast<int>(SCREEN_H) / r.h);
+    return true;
+  }
+  return false;
+}
+
+const frontend::View* bottom_view() {
+  for (const frontend::View& v : views) if (v.screen == 1 && drawn(v)) return &v;
+  return nullptr;
+}
+
+// Moves what a save's SPU catch-up mixed into the carry, so it is played
+// (and saved) with the next frame instead of lost to the load.
+void collect_carry() {
+  s16 buf[2048 * 2];
+  for (size_t n; (n = nds->spu.take(buf, 2048)) != 0;) carry.insert(carry.end(), buf, buf + n * 2);
+  if (carry.size() > CARRY_MAX * 2) carry.erase(carry.begin(), carry.end() - CARRY_MAX * 2);
+}
+
+size_t state_bytes(size_t machine) { return 8 + machine + 4 + CARRY_MAX * 4; }
 
 // The game's CPAD analog patch from the built-in database (cheat/analog_db),
 // enabled as the SDL frontend's Options > Analog would: the fuller "Nub"
@@ -381,10 +443,15 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     log(RETRO_LOG_WARN, "no ROM and no real dumps: nothing boots");
   }
   rebuild_cheats();
+  carry.clear(); swapped = false;
 #if DSPERATE_JIT
   if (var("dsperate_jit") != "disabled" && !jit::attach(*nds, true, true)) log(RETRO_LOG_WARN, "jit: could not attach, interpreting");
 #endif
   apply_vars(true);
+  std::string why;
+  if (const size_t m = nds->state_size_max(why)) state_max = state_bytes(m);
+  else { state_max = 0; log(RETRO_LOG_WARN, "state: no size yet (%s)", why.c_str()); }
+  collect_carry();
   return true;
 }
 
@@ -395,12 +462,15 @@ RETRO_API void retro_unload_game() {
   close_mic();
   nds.reset();
   save_path.clear();
+  state_max = 0; carry.clear();
+  state_w.data() = {};
 }
 
 RETRO_API void retro_reset() {
   if (!nds) return;
   nds->reset();
   if (nds->cart) nds->setup_direct_boot();
+  carry.clear();
 }
 
 RETRO_API void retro_run() {
@@ -425,6 +495,10 @@ RETRO_API void retro_run() {
   const bool lid_btn = btn(RETRO_DEVICE_ID_JOYPAD_L3);
   if (lid_btn && !lid_btn_was) lid_closed = !lid_closed;
   lid_btn_was = lid_btn; in.lid = lid_closed;
+  // The swap button, unless R3 is the stick stylus's tap.
+  const bool swap_btn = swap_button_on && !(touch_stick != NoStick && swap_button == RETRO_DEVICE_ID_JOYPAD_R3) && btn(swap_button);
+  if (swap_btn && !swap_button_was) { swapped = !swapped; relayout(); }
+  swap_button_was = swap_btn;
   // Analog patch: sticks in SDL range (libretro's is the same), ZL/ZR on the triggers.
   if (nds->analog_patch) {
     in.cpad_x = axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X); in.cpad_y = axis(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
@@ -433,8 +507,7 @@ RETRO_API void retro_run() {
   }
   // Stylus: the pointer spans the whole output frame and only the bottom
   // screen takes a touch; or a stick moves a cursor and R3 taps.
-  u32 bx, by, w, h; frame_size(w, h);
-  const bool bottom_shown = screen_origin(1, bx, by);
+  const frontend::View* bottom = bottom_view();
   if (touch_stick != NoStick) {
     const unsigned idx = touch_stick == Right ? RETRO_DEVICE_INDEX_ANALOG_RIGHT : RETRO_DEVICE_INDEX_ANALOG_LEFT;
     constexpr float SPEED = 4.0f;   // ponytail: pixels per frame at full deflection; an option if someone asks
@@ -442,10 +515,10 @@ RETRO_API void retro_run() {
     cursor_y = std::clamp(cursor_y + axis(idx, RETRO_DEVICE_ID_ANALOG_Y) / 32767.0f * SPEED, 0.0f, SCREEN_H - 1.0f);
     if (btn(RETRO_DEVICE_ID_JOYPAD_R3)) { in.down = true; in.x = static_cast<u8>(cursor_x); in.y = static_cast<u8>(cursor_y); }
   }
-  if (bottom_shown && input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED)) {
-    const int px = (input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x8000) * static_cast<int>(w) / 0x10000 - static_cast<int>(bx);
-    const int py = (input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x8000) * static_cast<int>(h) / 0x10000 - static_cast<int>(by);
-    if (px >= 0 && px < static_cast<int>(SCREEN_W) && py >= 0 && py < static_cast<int>(SCREEN_H)) { in.down = true; in.x = static_cast<u8>(px); in.y = static_cast<u8>(py); }
+  if (bottom && input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_PRESSED)) {
+    const int px = (input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_X) + 0x8000) * static_cast<int>(out_w) / 0x10000;
+    const int py = (input_state_cb(0, RETRO_DEVICE_POINTER, 0, RETRO_DEVICE_ID_POINTER_Y) + 0x8000) * static_cast<int>(out_h) / 0x10000;
+    if (pointer_touch(px, py, in.x, in.y)) in.down = true;
   }
   // Microphone: the host's, or white noise while a trigger is held (blowing).
   static std::vector<s16> mic_buf;
@@ -468,16 +541,19 @@ RETRO_API void retro_run() {
 
   nds->run_frame();
 
-  for (int s = 0; s < 2; ++s) { u32 x, y; if (screen_origin(s, x, y)) blit(s, x, y); }
-  if (touch_stick != NoStick && bottom_shown) {   // a small white cross where the stylus is
-    const int cx = static_cast<int>(cursor_x), cy = static_cast<int>(cursor_y);
+  for (int i = 0; i < frontend::SCREENS; ++i) if (drawn(views[i])) blit(views[i], source_x[i]);
+  if (touch_stick != NoStick && bottom) {   // a small white cross where the stylus is
+    const frontend::Rect& r = bottom->rect;
+    const int cx = r.x + static_cast<int>(cursor_x) * r.w / static_cast<int>(SCREEN_W);
+    const int cy = r.y + static_cast<int>(cursor_y) * r.h / static_cast<int>(SCREEN_H);
     for (int d = -3; d <= 3; ++d) {
-      if (cx + d >= 0 && cx + d < static_cast<int>(SCREEN_W)) frame[(by + cy) * w + bx + cx + d] = 0xFFFFFFFFu;
-      if (cy + d >= 0 && cy + d < static_cast<int>(SCREEN_H)) frame[(by + cy + d) * w + bx + cx] = 0xFFFFFFFFu;
+      if (cx + d >= 0 && cx + d < static_cast<int>(out_w) && cy >= 0 && cy < static_cast<int>(out_h)) frame[static_cast<size_t>(cy) * out_w + cx + d] = 0xFFFFFFFFu;
+      if (cy + d >= 0 && cy + d < static_cast<int>(out_h) && cx >= 0 && cx < static_cast<int>(out_w)) frame[static_cast<size_t>(cy + d) * out_w + cx] = 0xFFFFFFFFu;
     }
   }
-  video_cb(frame.data(), w, h, w * 4);
+  video_cb(frame.data(), out_w, out_h, out_w * 4);
 
+  if (!carry.empty()) { audio_batch_cb(carry.data(), carry.size() / 2); carry.clear(); }
   s16 buf[2048 * 2];
   for (size_t n; (n = nds->spu.take(buf, 2048)) != 0;) audio_batch_cb(buf, n);
 
@@ -495,30 +571,46 @@ RETRO_API void retro_run() {
   }
 }
 
-// Save states: the core's own stream behind an 8-byte length, so a frontend
-// buffer sized with headroom reads back exactly what was written.
+// Save states: one fixed size for the session (RetroArch's rewind and
+// run-ahead size their buffers once), taken without a second serialisation.
+// Layout: the machine state's length (u64), the state, the carried samples'
+// frame count (u32) and the samples, zeros to the end.
 RETRO_API size_t retro_serialize_size() {
-  if (!nds) return 0;
-  state::Writer w; std::string err;
-  if (!nds->save_state(w, err)) return 0;
-  return w.data().size() + w.data().size() / 8 + 8;   // ponytail: +12.5% headroom for frame-to-frame growth
+  if (nds && !state_max) {
+    std::string why;
+    if (const size_t m = nds->state_size_max(why)) state_max = state_bytes(m);
+    collect_carry();
+  }
+  return state_max;
 }
 RETRO_API bool retro_serialize(void* data, size_t size) {
-  if (!nds) return false;
-  state::Writer w; std::string err;
-  if (!nds->save_state(w, err)) { log(RETRO_LOG_ERROR, "state: %s", err.c_str()); return false; }
-  const u64 n = w.data().size();
-  if (n + 8 > size) return false;
-  std::memcpy(data, &n, 8);
-  std::memcpy(static_cast<u8*>(data) + 8, w.data().data(), n);
+  if (!nds || !state_max || size < state_max) return false;
+  state_w.data().clear();
+  std::string err;
+  if (!nds->save_state(state_w, err)) { log(RETRO_LOG_ERROR, "state: %s", err.c_str()); return false; }
+  collect_carry();
+  const u64 n = state_w.data().size();
+  const u32 c = static_cast<u32>(carry.size() / 2);
+  if (8 + n + 4 + size_t{c} * 4 > state_max) { log(RETRO_LOG_ERROR, "state: %llu bytes, over this session's %zu", static_cast<unsigned long long>(n), state_max); return false; }
+  u8* p = static_cast<u8*>(data);
+  std::memcpy(p, &n, 8); p += 8;
+  std::memcpy(p, state_w.data().data(), n); p += n;
+  std::memcpy(p, &c, 4); p += 4;
+  if (c) { std::memcpy(p, carry.data(), size_t{c} * 4); p += size_t{c} * 4; }
+  std::memset(p, 0, static_cast<size_t>(static_cast<u8*>(data) + size - p));
   return true;
 }
 RETRO_API bool retro_unserialize(const void* data, size_t size) {
-  if (!nds || size < 8) return false;
-  u64 n; std::memcpy(&n, data, 8);
-  if (n + 8 > size) return false;
-  state::Reader r(static_cast<const u8*>(data) + 8, n); std::string err;
+  if (!nds || size < 12) return false;
+  const u8* p = static_cast<const u8*>(data);
+  u64 n; std::memcpy(&n, p, 8);
+  if (n > size - 12) return false;
+  u32 c; std::memcpy(&c, p + 8 + n, 4);
+  if (c > CARRY_MAX || size_t{c} * 4 > size - 12 - n) return false;
+  state::Reader r(p + 8, n); std::string err;
   if (!nds->load_state(r, err)) { log(RETRO_LOG_ERROR, "state: %s", err.c_str()); return false; }
+  carry.resize(size_t{c} * 2);
+  if (c) std::memcpy(carry.data(), p + 8 + n + 4, size_t{c} * 4);
   return true;
 }
 

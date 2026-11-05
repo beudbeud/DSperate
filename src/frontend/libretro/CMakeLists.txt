@@ -4,4 +4,4 @@
 # other frontend, so it links nothing a RetroArch host lacks.
 add_library(dsperate_libretro SHARED libretro.cpp)
 set_target_properties(dsperate_libretro PROPERTIES PREFIX "" C_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden)
-target_link_libraries(dsperate_libretro PRIVATE dsperate_core)
+target_link_libraries(dsperate_libretro PRIVATE dsperate_core dsperate_frontend_video)
