@@ -222,10 +222,13 @@ a small screen for a TV, picture in picture, one screen), gap, swap, and a
 button that swaps the screens in game; GPU 3D (Vulkan, or OpenGL ES 3.1
 on the Pi 5's V3D driver: the raster opens its own EGL context, so no
 RetroArch hardware context is involved) and which of the two to use; 3D
-anti-aliasing; the internal resolution (2x to 4x: the Vulkan raster draws the
-3D layer at that scale and the core composes it there, the 2D layers
-pixel-repeated; a captured image stays native. On the Pi 5, Mario Kart DS in
-a race: 2x p99 9.6 ms a frame, 3x 15.1, 4x over budget); frameskip; the
+anti-aliasing; the internal resolution (2x to 4x: the GPU raster, Vulkan or
+OpenGL ES, draws the 3D layer at that scale and the core composes it there,
+the 2D layers pixel-repeated; a captured image stays native. On the Pi 5,
+Mario Kart DS in a race: 2x p99 9.6 ms a frame on Vulkan, 10.7 on OpenGL ES,
+3x 15.1 on Vulkan, 4x over budget); a 2D filter at that resolution (xBRZ at 25 to 100%
+on the text, logos and sprites, the 3D samples kept; sliced over three
+worker threads: about 2.2 ms a frame at 2x on the Pi 5); frameskip; the
 recompiler; direct or firmware boot; DS or DSi console (DSiWare runs with the
 DSi BIOS pair in the system directory, no NAND); firmware language; the
 built-in analog (CPAD) patches on the sticks; a stick-driven stylus (R3

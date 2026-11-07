@@ -2,7 +2,8 @@
 # Frontend video code with no windowing dependency: screen layout (and, as
 # the video overhaul lands, the presenters' shared pieces). Used by the SDL
 # frontend and the tests.
-add_library(dsperate_frontend_video STATIC layout.cpp select.cpp)
+# xbrz/ is Zenju's xBRZ 1.5 (GPL-3.0, from HqMAME), as is: the libretro 2D filter.
+add_library(dsperate_frontend_video STATIC layout.cpp select.cpp smooth2d.cpp xbrz/xbrz.cpp)
 target_link_libraries(dsperate_frontend_video PUBLIC dsperate_core)
 target_include_directories(dsperate_frontend_video PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 # Placement is float arithmetic: no fused multiply-add, so every architecture

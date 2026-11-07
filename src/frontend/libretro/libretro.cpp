@@ -14,6 +14,7 @@
 #include "core/io/dsi_title_install.h"
 #include "core/state/state.h"
 #include "frontend/video/layout.h"
+#include "frontend/video/smooth2d.h"
 #if DSPERATE_JIT
 #include "core/cpu/jit/jit.h"
 #endif
@@ -67,6 +68,7 @@ float cursor_x = SCREEN_W / 2.0f, cursor_y = SCREEN_H / 2.0f;   // stick-driven 
 frontend::Layout lay;           // the shared layout arithmetic (frontend/video/layout.h)
 int lay_scale = 1;              // output pixels per DS pixel
 u32 ires = 1;                   // the internal resolution: source pixels per DS pixel (Gpu::hires_frame)
+u32 smooth2d = 0;               // dsperate_2d_filter: xBRZ on the 2D at the internal resolution, its strength in % (0: off)
 int lay_first = 0;              // the screen the layout option puts first (top, left, large or alone)
 bool swap_screens = false;      // the option
 bool swapped = false;           // toggled in game by the swap button
@@ -106,8 +108,10 @@ retro_core_option_v2_definition DEFS[] = {
    {{"auto", "Auto"}, {"vulkan", "Vulkan"}, {"opengl", "OpenGL ES"}, {nullptr, nullptr}}, "auto"},
   {"dsperate_aa", "Video > 3D anti-aliasing", "3D anti-aliasing", "The DS's own edge blend on the CPU raster, 4x MSAA on Vulkan. The OpenGL ES raster has none.", nullptr, "video",
    {ON_OFF, {nullptr, nullptr}}, "disabled"},
-  {"dsperate_internal_res", "Video > Internal resolution", "Internal resolution", "The 3D layer drawn at a multiple of the DS's 256x192, the 2D layers pixel-repeated. Needs GPU 3D on the Vulkan backend (anti-aliasing is then the scale's own); elsewhere the picture is only enlarged. Captured images (some games' 3D on both screens) stay native.", nullptr, "video",
+  {"dsperate_internal_res", "Video > Internal resolution", "Internal resolution", "The 3D layer drawn at a multiple of the DS's 256x192, the 2D layers pixel-repeated. Needs GPU 3D (Vulkan or OpenGL ES; anti-aliasing is then the scale's own); without it the picture is only enlarged. Captured images (some games' 3D on both screens) stay native.", nullptr, "video",
    {{"1", "Native (256x192)"}, {"2", "2x (512x384)"}, {"3", "3x (768x576)"}, {"4", "4x (1024x768)"}, {nullptr, nullptr}}, "1"},
+  {"dsperate_2d_filter", "Video > 2D filter", "2D filter", "Smooths the 2D pixel art (text, logos, HUD, sprites) at the internal resolution with xBRZ, mixed over the original pixels at the strength chosen; the 3D keeps its own samples. Needs an internal resolution above native.", nullptr, "video",
+   {{"none", "Off"}, {"xbrz25", "xBRZ 25%"}, {"xbrz50", "xBRZ 50%"}, {"xbrz75", "xBRZ 75%"}, {"xbrz", "xBRZ 100%"}, {nullptr, nullptr}}, "none"},
   {"dsperate_frameskip", "Video > Frameskip", "Frameskip", "Frames skipped for each one drawn. The game runs as usual; only drawing is skipped.", nullptr, "video",
    {{"0", "Off"}, {"1", nullptr}, {"2", nullptr}, {"3", nullptr}, {nullptr, nullptr}}, "0"},
   {"dsperate_jit", "System > Recompiler", "Recompiler", "ARM to native recompiler for both CPUs. Off: the interpreter (slow). Takes effect on the next load.", nullptr, "system",
@@ -228,6 +232,10 @@ void apply_vars(bool at_load) {
     relayout();
     if (!at_load && (ow != out_w || oh != out_h)) { retro_game_geometry g = geometry(); env_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &g); }
   }
+    {
+    const std::string f = var("dsperate_2d_filter");
+    smooth2d = f == "xbrz" ? 100 : f.rfind("xbrz", 0) == 0 ? static_cast<u32>(std::clamp(std::atoi(f.c_str() + 4), 1, 100)) : 0;
+  }
   const std::string sb = var("dsperate_swap_button");
   swap_button_on = sb != "disabled";
   swap_button = sb == "l2" ? RETRO_DEVICE_ID_JOYPAD_L2 : sb == "r2" ? RETRO_DEVICE_ID_JOYPAD_R2 : RETRO_DEVICE_ID_JOYPAD_R3;
@@ -294,6 +302,12 @@ void blit(int i) {
   const u32* hfb = hi ? nds->gpu.hires_frame(v.screen) : nullptr;
   const int hw = static_cast<int>(SCREEN_W * ires), hh = static_cast<int>(SCREEN_H * ires);
   const int x0 = std::max(0, r.x), x1 = std::min<int>(out_w, r.x + r.w);
+  if (hfb && smooth2d && r.w == hw && r.h == hh && r.x >= 0 && r.y >= 0 && r.x + r.w <= static_cast<int>(out_w) && r.y + r.h <= static_cast<int>(out_h)) {
+    bool rows[SCREEN_H];
+    for (u32 y = 0; y < SCREEN_H; ++y) rows[y] = nds->gpu.hires_row(v.screen, y);
+    frontend::smooth2d_screen(fb, hfb, rows, ires, &frame[static_cast<size_t>(r.y) * out_w + static_cast<size_t>(r.x)], out_w, smooth2d);
+    return;
+  }
   int last = -1;   // the DS line the row above showed from the 1x frame
   for (int y = std::max(0, r.y); y < std::min<int>(out_h, r.y + r.h); ++y) {
     u32* dst = &frame[static_cast<size_t>(y) * out_w];

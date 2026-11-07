@@ -27,6 +27,10 @@ add_executable(test_select select_test.cpp)
 target_link_libraries(test_select PRIVATE dsperate_frontend_video)
 add_test(NAME select COMMAND test_select)
 
+add_executable(test_smooth2d smooth2d_test.cpp)
+target_link_libraries(test_smooth2d PRIVATE dsperate_frontend_video)
+add_test(NAME smooth2d COMMAND test_smooth2d)
+
 add_executable(test_io io_test.cpp)
 target_link_libraries(test_io PRIVATE dsperate_core)
 add_test(NAME io COMMAND test_io)
