@@ -10,6 +10,13 @@ Built for and measured on ARM handhelds (the Anbernic RG DS, an RK3566 with
 four A55 cores); commercial games boot and play. Everything is verified against
 melonDS with frame dumps and instruction traces.
 
+This branch also builds DSperate as a **libretro core** (`dsperate_libretro.so`)
+for RetroArch and Recalbox, tuned for the Raspberry Pi 4 and 5: GPU 3D on
+Vulkan or OpenGL ES, internal resolution up to 4x, an xBRZ 2D filter, save
+states with rewind and run-ahead, cheats and achievements. See
+[libretro core](#libretro-core-retroarch-raspberry-pi-5) for the build and the
+core options.
+
 DSperate is a **clean-room** reimplementation of DraStic's *techniques*,
 documented by studying its freely-distributable debug-symbol build (approved
 for distribution by its developer, Exophase) and measuring it on real
