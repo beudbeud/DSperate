@@ -107,6 +107,21 @@ int main(int argc, char** argv) {
     }
   }
 
+  { // The internal resolution multiplies the frame with the GPU raster on, and only then.
+    set("dsperate_internal_res", "2");
+    c.retro_run();
+    CHECK(width == 256 && height == 384);
+    set("dsperate_gpu3d", "enabled");
+    c.retro_run();
+    CHECK(width == 512 && height == 768);
+    set("dsperate_layout", "hybrid");
+    c.retro_run();
+    CHECK(width == 768 && height == 384);   // hybrid is 2x already: the large screen at the scale
+    set("dsperate_layout", "vertical"); set("dsperate_internal_res", "1"); set("dsperate_gpu3d", "disabled");
+    c.retro_run();
+    CHECK(width == 256 && height == 384);
+  }
+
   const size_t size = c.retro_serialize_size();
   { // The state size is fixed for the session, whatever the machine holds.
     CHECK(size > 1024 * 1024);

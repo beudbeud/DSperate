@@ -66,6 +66,7 @@ float cursor_x = SCREEN_W / 2.0f, cursor_y = SCREEN_H / 2.0f;   // stick-driven 
 // Options, read by apply_vars.
 frontend::Layout lay;           // the shared layout arithmetic (frontend/video/layout.h)
 int lay_scale = 1;              // output pixels per DS pixel
+u32 ires = 1;                   // the internal resolution: source pixels per DS pixel (Gpu::hires_frame)
 int lay_first = 0;              // the screen the layout option puts first (top, left, large or alone)
 bool swap_screens = false;      // the option
 bool swapped = false;           // toggled in game by the swap button
@@ -73,6 +74,7 @@ unsigned swap_button = RETRO_DEVICE_ID_JOYPAD_R3; bool swap_button_on = true, sw
 u32 out_w = SCREEN_W, out_h = SCREEN_H * 2;
 frontend::View views[frontend::SCREENS];
 std::vector<u16> source_x[frontend::SCREENS];   // per view: the DS column each output column shows
+std::vector<u16> source_xh[frontend::SCREENS];  // the same in the internal-resolution frame (blit's `hi`)
 bool gpu3d = false, aa = false; int frameskip = 0;
 enum TouchStick { NoStick, Right, Left } touch_stick = NoStick;
 enum Mic { NoMic, HostMic, NoiseL2, NoiseR2 } mic_mode = NoMic;
@@ -104,6 +106,8 @@ retro_core_option_v2_definition DEFS[] = {
    {{"auto", "Auto"}, {"vulkan", "Vulkan"}, {"opengl", "OpenGL ES"}, {nullptr, nullptr}}, "auto"},
   {"dsperate_aa", "Video > 3D anti-aliasing", "3D anti-aliasing", "The DS's own edge blend on the CPU raster, 4x MSAA on Vulkan. The OpenGL ES raster has none.", nullptr, "video",
    {ON_OFF, {nullptr, nullptr}}, "disabled"},
+  {"dsperate_internal_res", "Video > Internal resolution", "Internal resolution", "The 3D layer drawn at a multiple of the DS's 256x192, the 2D layers pixel-repeated. Needs GPU 3D on the Vulkan backend (anti-aliasing is then the scale's own); elsewhere the picture is only enlarged. Captured images (some games' 3D on both screens) stay native.", nullptr, "video",
+   {{"1", "Native (256x192)"}, {"2", "2x (512x384)"}, {"3", "3x (768x576)"}, {"4", "4x (1024x768)"}, {nullptr, nullptr}}, "1"},
   {"dsperate_frameskip", "Video > Frameskip", "Frameskip", "Frames skipped for each one drawn. The game runs as usual; only drawing is skipped.", nullptr, "video",
    {{"0", "Off"}, {"1", nullptr}, {"2", nullptr}, {"3", nullptr}, {nullptr, nullptr}}, "0"},
   {"dsperate_jit", "System > Recompiler", "Recompiler", "ARM to native recompiler for both CPUs. Off: the interpreter (slow). Takes effect on the next load.", nullptr, "system",
@@ -169,20 +173,24 @@ bool drawn(const frontend::View& v) { return v.direct || v.shown; }
 void relayout() {
   lay.primary = lay_first ^ (swap_screens != swapped ? 1 : 0);
   int w, h;
-  frontend::natural_size(lay, lay_scale, w, h);
+  frontend::natural_size(lay, std::max<int>(lay_scale, static_cast<int>(ires)), w, h);
   out_w = static_cast<u32>(w); out_h = static_cast<u32>(h);
   frontend::place(lay, w, h, views);
   for (int i = 0; i < frontend::SCREENS; ++i) {
     const frontend::Rect& r = views[i].rect;
     source_x[i].resize(static_cast<size_t>(std::max(0, r.w)));
-    for (int x = 0; x < r.w; ++x) source_x[i][static_cast<size_t>(x)] = static_cast<u16>(x * static_cast<int>(SCREEN_W) / r.w);
+    source_xh[i].resize(static_cast<size_t>(std::max(0, r.w)));
+    for (int x = 0; x < r.w; ++x) {
+      source_x[i][static_cast<size_t>(x)] = static_cast<u16>(x * static_cast<int>(SCREEN_W) / r.w);
+      source_xh[i][static_cast<size_t>(x)] = static_cast<u16>(x * static_cast<int>(SCREEN_W * ires) / r.w);
+    }
   }
   frame.assign(static_cast<size_t>(w) * h, 0xFF000000u);
 }
 
 retro_game_geometry geometry() {
-  // The largest any layout gets: hybrid at 2x with a 90-pixel gap, vertical with one.
-  return {out_w, out_h, SCREEN_W * 3 + 90, SCREEN_H * 2 + 90, static_cast<float>(out_w) / static_cast<float>(out_h)};
+  // The largest any layout gets: hybrid with a 90-pixel gap, vertical with one, at 4x.
+  return {out_w, out_h, SCREEN_W * 3 * 4 + 90, SCREEN_H * 2 * 4 + 90, static_cast<float>(out_w) / static_cast<float>(out_h)};
 }
 
 bool open_mic() {
@@ -211,9 +219,12 @@ void apply_vars(bool at_load) {
   const int scale = nl.mode == frontend::Mode::DominantH || nl.mode == frontend::Mode::Pip ? 2 : 1;
   const int first = l == "bottom" ? 1 : 0;
   const bool ns = var("dsperate_swap_screens") == "enabled";
-  if (nl.mode != lay.mode || nl.gap != lay.gap || scale != lay_scale || first != lay_first || ns != swap_screens || at_load) {
+  // The internal resolution only matters with the GPU raster; without it the picture would only be enlarged.
+  const u32 ir = var("dsperate_gpu3d") == "enabled" ? static_cast<u32>(std::clamp(std::atoi(var("dsperate_internal_res").c_str()), 1, 4)) : 1u;
+  if (nl.mode != lay.mode || nl.gap != lay.gap || scale != lay_scale || first != lay_first || ns != swap_screens || ir != ires || at_load) {
     const u32 ow = out_w, oh = out_h;
-    lay = nl; lay_scale = scale; lay_first = first; swap_screens = ns;
+    lay = nl; lay_scale = scale; lay_first = first; swap_screens = ns; ires = ir;
+    if (nds) nds->gpu.set_hires(ires);
     relayout();
     if (!at_load && (ow != out_w || oh != out_h)) { retro_game_geometry g = geometry(); env_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &g); }
   }
@@ -271,15 +282,34 @@ std::string dir_env(unsigned cmd) {
 }
 
 // Screen `v.screen` into its rect, nearest-neighbour when the rect is not 1x.
-void blit(const frontend::View& v, const std::vector<u16>& sx) {
-  const u32* src = nds->gpu.framebuffer(v.screen);
+// A DS line the core composed at the internal resolution (Gpu::hires_row)
+// comes from that frame, where the rect is at least its size (thinned out by
+// nearest it would drop samples: the hybrid layout's small screen); any other
+// from the 1x frame, each output row after a line's first a copy of the one above.
+void blit(int i) {
+  const frontend::View& v = views[i];
   const frontend::Rect& r = v.rect;
+  const bool hi = ires > 1 && r.w >= static_cast<int>(SCREEN_W * ires);
+  const u32* fb = nds->gpu.framebuffer(v.screen);
+  const u32* hfb = hi ? nds->gpu.hires_frame(v.screen) : nullptr;
+  const int hw = static_cast<int>(SCREEN_W * ires), hh = static_cast<int>(SCREEN_H * ires);
+  const int x0 = std::max(0, r.x), x1 = std::min<int>(out_w, r.x + r.w);
+  int last = -1;   // the DS line the row above showed from the 1x frame
   for (int y = std::max(0, r.y); y < std::min<int>(out_h, r.y + r.h); ++y) {
-    const u32* row = src + static_cast<size_t>((y - r.y) * static_cast<int>(SCREEN_H) / r.h) * SCREEN_W;
     u32* dst = &frame[static_cast<size_t>(y) * out_w];
-    const int x0 = std::max(0, r.x), x1 = std::min<int>(out_w, r.x + r.w);
-    if (r.w == static_cast<int>(SCREEN_W)) { std::memcpy(dst + x0, row + (x0 - r.x), static_cast<size_t>(x1 - x0) * 4); continue; }
-    for (int x = x0; x < x1; ++x) dst[x] = row[sx[static_cast<size_t>(x - r.x)]];
+    const int ly = (y - r.y) * static_cast<int>(SCREEN_H) / r.h;
+    if (hfb && nds->gpu.hires_row(v.screen, static_cast<u32>(ly))) {
+      const u32* row = hfb + static_cast<size_t>((y - r.y) * hh / r.h) * hw;
+      if (r.w == hw) std::memcpy(dst + x0, row + (x0 - r.x), static_cast<size_t>(x1 - x0) * 4);
+      else for (int x = x0; x < x1; ++x) dst[x] = row[source_xh[i][static_cast<size_t>(x - r.x)]];
+      last = -1;
+      continue;
+    }
+    if (ly == last) { std::memcpy(dst + x0, dst - out_w + x0, static_cast<size_t>(x1 - x0) * 4); continue; }
+    const u32* row = fb + static_cast<size_t>(ly) * SCREEN_W;
+    if (r.w == static_cast<int>(SCREEN_W)) std::memcpy(dst + x0, row + (x0 - r.x), static_cast<size_t>(x1 - x0) * 4);
+    else for (int x = x0; x < x1; ++x) dst[x] = row[source_x[i][static_cast<size_t>(x - r.x)]];
+    last = ly;
   }
 }
 
@@ -541,7 +571,7 @@ RETRO_API void retro_run() {
 
   nds->run_frame();
 
-  for (int i = 0; i < frontend::SCREENS; ++i) if (drawn(views[i])) blit(views[i], source_x[i]);
+  for (int i = 0; i < frontend::SCREENS; ++i) if (drawn(views[i])) blit(i);
   if (touch_stick != NoStick && bottom) {   // a small white cross where the stylus is
     const frontend::Rect& r = bottom->rect;
     const int cx = r.x + static_cast<int>(cursor_x) * r.w / static_cast<int>(SCREEN_W);
