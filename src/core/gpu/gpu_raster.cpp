@@ -28,7 +28,7 @@ std::unique_ptr<Raster3D> Raster3D::create(bool aa, bool edges, u32 scale, std::
     }
   }
   if (want_gl) {
-    std::unique_ptr<gl::Lean> l = gl::Lean::create(aa, edges, &wg);
+    std::unique_ptr<gl::Lean> l = gl::Lean::create(aa, edges, scale, &wg);
     if (l && l->ready()) return l;
   }
   if (why) *why = "Vulkan: " + wv + "; OpenGL ES: " + wg;

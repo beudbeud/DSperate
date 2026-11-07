@@ -47,7 +47,7 @@ bool Api::load(std::string* why) {
   R(glGenBuffers); R(glDeleteBuffers); R(glBindBuffer); R(glBindBufferBase); R(glBindBufferRange); R(glBufferData); R(glBufferSubData);
   R(glMapBufferRange); R(glUnmapBuffer); R(glFlushMappedBufferRange);
   R(glGenTextures); R(glDeleteTextures); R(glBindTexture); R(glActiveTexture); R(glTexStorage2D); R(glTexSubImage2D); R(glTexParameteri); R(glPixelStorei);
-  R(glGenFramebuffers); R(glDeleteFramebuffers); R(glBindFramebuffer); R(glFramebufferTexture2D); R(glCheckFramebufferStatus); R(glDrawBuffers); R(glReadBuffer); R(glReadPixels);
+  R(glGenFramebuffers); R(glDeleteFramebuffers); R(glBindFramebuffer); R(glFramebufferTexture2D); R(glCheckFramebufferStatus); R(glDrawBuffers); R(glReadBuffer); R(glReadPixels); R(glBlitFramebuffer);
   R(glInvalidateFramebuffer); R(glClearBufferfv); R(glClearBufferuiv); R(glClearBufferfi);
   R(glViewport); R(glScissor); R(glDepthRangef); R(glEnable); R(glDisable); R(glDepthFunc); R(glDepthMask); R(glStencilFunc); R(glStencilOp); R(glStencilMask); R(glColorMask);
   R(glBlendFuncSeparate); R(glBlendEquationSeparate);

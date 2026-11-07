@@ -6,7 +6,7 @@
 namespace ds::gpu::gl {
 struct Lean::Impl {};
 Lean::~Lean() = default;
-std::unique_ptr<Lean> Lean::create(bool, bool, std::string* why) { if (why) *why = "built without OpenGL ES"; return nullptr; }
+std::unique_ptr<Lean> Lean::create(bool, bool, u32, std::string* why) { if (why) *why = "built without OpenGL ES"; return nullptr; }
 bool Lean::edges() const { return false; }
 vk::GpuPoly* Lean::poly_buffer() { return nullptr; }
 vk::GpuVert* Lean::vert_buffer() { return nullptr; }

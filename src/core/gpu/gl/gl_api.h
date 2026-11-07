@@ -128,6 +128,7 @@ struct Api {
   void (*glDrawBuffers)(GLsizei, const GLenum*) = nullptr;
   void (*glReadBuffer)(GLenum) = nullptr;
   void (*glReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*) = nullptr;
+  void (*glBlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum) = nullptr;
   void (*glInvalidateFramebuffer)(GLenum, GLsizei, const GLenum*) = nullptr;
   void (*glClearBufferfv)(GLenum, GLint, const GLfloat*) = nullptr;
   void (*glClearBufferuiv)(GLenum, GLint, const GLuint*) = nullptr;
