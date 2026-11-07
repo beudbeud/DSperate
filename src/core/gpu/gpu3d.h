@@ -201,6 +201,12 @@ public:
     }
     return 0;
   }
+  // Row `sub` (0..scale-1) of DS line y at the internal resolution, 256*scale
+  // words in the record's layout, scrolled as line() scrolls; null on a 1x
+  // frame. After line(f, y), which picks the frame. The record is the GPU's
+  // uncached readback: the row is copied out in one wide copy (a load a
+  // sample cost 3.4x more on the Pi 5), into a buffer the next call reuses.
+  const u32* hires_line(const Renderer3D::FrameRef& f, u32 y, u32 sub, u32* scale);
   const u32* edge_line(const Renderer3D::FrameRef& f, u32 y) const {
     if (render_xpos_) return nullptr;
     if (!f.edge_bytes) return f.edge_line(y);
@@ -347,6 +353,7 @@ private:
   bool edge_gap_ = true;                // edge_line: fill the pixels a run passes through without a byte (DS_EDGE_GAP=0 off)
   std::atomic<bool> render_on_{false};
   alignas(16) u32 scrolled_[256] = {};
+  alignas(16) u32 hires_row_[256 * 4] = {};   // hires_line's row
 
   // Matrices (20.12, row-major: m[row*4+col]).
   u32 matrix_mode_ = 0;

@@ -894,6 +894,40 @@ void Gpu::capture_edges(u32 cnt, u32 line, u32 width, u32 dst_bank, u32 lcdc) {
   else if (pick != edst) std::memmove(edst, pick, width);
 }
 
+void Gpu::set_hires(u32 n) {
+  n = std::clamp<u32>(n, 1, 4);
+  if (n == hires_n_) return;
+  nds_.gpu3d.sync_raster();
+  hires_n_ = n;
+  nds_.gpu3d.renderer().set_gpu_scale(n);
+  engine[0].set_hires(n > 1);
+  for (int sc = 0; sc < 2; ++sc) {
+    if (n > 1) hires_fb_[sc].assign(SCREEN_W * SCREEN_H * n * n, 0xFF000000); else { hires_fb_[sc].clear(); hires_fb_[sc].shrink_to_fit(); }
+    hires_rows_[sc][0] = hires_rows_[sc][1] = hires_rows_[sc][2] = 0;
+  }
+}
+
+// The line at the internal resolution: engine A's graphics display recomposed
+// over the 3D layer's samples at that scale (Engine2D::compose3d_hires). Any
+// other line is left to the 1x frame (hires_rows): repeating it here would
+// write the frame again for nothing (0.8 ms a frame at 3x on the Pi 5).
+void Gpu::output_hires(const Engine2D& en, int screen, u32 line) {
+  const u32 n = hires_n_, w = SCREEN_W * n;
+  u64& row = hires_rows_[screen][line >> 6];
+  const u64 bit = u64{1} << (line & 63);
+  const bool live3d = &en == &engine[0] && screens_on_ && ((en.dispcnt() >> 16) & 3) == 1 && en.hires_composable();
+  u32 sc = 0;
+  const u32* h = live3d ? nds_.gpu3d.hires_line(ref3d_, line, 0, &sc) : nullptr;
+  alignas(16) Pixel px[SCREEN_W * 4];
+  if (!h || sc != n || !en.compose3d_hires(h, n, px)) { row &= ~bit; return; }
+  u32* const row0 = hires_fb_[screen].data() + line * n * w;
+  for (u32 sub = 0; sub < n; ++sub) {
+    if (sub) en.compose3d_hires(nds_.gpu3d.hires_line(ref3d_, line, sub, &sc), n, px);
+    for (u32 c = 0; c < n; ++c) kern::active::output_line(px + c * SCREEN_W, en.master_bright(), row0 + sub * w + c * SCREEN_W);
+  }
+  row |= bit;
+}
+
 void Gpu::output_engine(int e, u32 line) {
   prof::Scope sc(prof::OUTPUT, e == 0);
   const Engine2D& en = engine[e];
@@ -912,6 +946,7 @@ void Gpu::output_engine(int e, u32 line) {
     }
   } else { for (u32 i = 0; i < 256; ++i) dst[i] = 0xFF000000; }
   if (edge_export_ && !scaled) output_edges(en, screen, line, dst);
+  if (hires_n_ > 1 && !scaled) output_hires(en, screen, line);
   if (scaled) {
     if (e == 1 && bscale_defer_ && bscale_n_ < SCREEN_H) {
       StashedLine& st = bscale_[bscale_n_++];

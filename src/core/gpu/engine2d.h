@@ -91,6 +91,19 @@ public:
   // those edge pixels as shown.
   void set_edge_vram(const u8* v) { edge_vram_ = v; }
   bool edge_compose(Pixel* own, u8* bytes) const;
+  // The internal-resolution output (Gpu::set_hires): on engine A, lines with
+  // the 3D layer take the full path so that what lies under the 3D layer is
+  // known. After render_line, compose3d_hires gives one row of the line at
+  // `n` (at most 4) times the width: `h` is that row of the 3D layer at the scale (256*n
+  // record words), `dst` 256*n pixels before master brightness, as output().
+  // Each 1x pixel the 3D layer shows on (or would, at a sample it covers
+  // there) is recomposed per sample with the 1x pixel's layers and effects;
+  // the rest repeat the 1x pixel. False: the line is not one it can compose
+  // (the caller repeats output()).
+  // ponytail: the layer under the 3D one is shown alone where the 3D sample is empty; a blend of it with a third layer is the 1x one's.
+  void set_hires(bool on) { hires_ = on; }
+  bool compose3d_hires(const u32* h, u32 n, Pixel* dst) const;
+  bool hires_composable() const { return top_mode_ == TOP_FULL && hires_line(); }
 
   u32 bldcnt() const { return regs_.bldcnt(); }
   u32 eva() const { return regs_.eva(); }
@@ -154,6 +167,8 @@ private:
   alignas(16) std::array<u8, 256> top_id_{}, top_kind_{}, top_alpha_{}, second_id_{};
   alignas(16) std::array<Pixel, 256> out_{};
   const Pixel* line3d_ = nullptr;
+  bool hires_ = false;
+  bool hires_line() const { return hires_ && !num_ && (cur_.dispcnt & 8) && (cur_.layer_enable & 1); }
   const u32* edge3d_ = nullptr;
   const u8* edge_vram_ = nullptr;
   alignas(16) u8 bg_edge_[4][256]{};   // per BG, the edge bytes its bitmap row carried this line (bg_edge_any_)

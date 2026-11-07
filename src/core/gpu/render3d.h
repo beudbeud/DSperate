@@ -73,6 +73,12 @@ public:
   // video.aa = enhanced: on the GPU raster the edge cut also cuts texture cut-out edges (the cut-out pass). Nothing on the CPU raster.
   void set_aa_enhanced(bool on) { aa_enhanced_ = on; }
   bool aa_enhanced() const { return aa_enhanced_; }
+  // The GPU raster's internal resolution (1-4): above 1 each GPU frame also
+  // carries its record at that scale (FrameRef::hires), for a frontend to
+  // compose at that resolution; the emulation keeps reading the 1x record.
+  // Applied at the next render, like set_aa. Coordinator only.
+  void set_gpu_scale(u32 n) { gpu_scale_ = n < 1 ? 1 : n > 4 ? 4 : n; }
+  u32 gpu_scale() const { return gpu_scale_; }
   // The panel-density edge cut (core/gpu/edge_cut.h): beside each output
   // line, the final pass writes an edge plane (FrameRef::edges), one word a
   // pixel, zero where nothing is cut. An edge pixel the AA blend mixes keeps
@@ -423,6 +429,8 @@ public:
     mutable const u32* out = nullptr;
     const u32* edges = nullptr;   // the edge plane (set_edge_export), or null
     mutable const u8* edge_bytes = nullptr;   // a GPU frame's edge bytes instead (Raster3D::edges_for), picked with its record
+    mutable const u32* hires = nullptr;   // a GPU frame's record at the internal resolution (Raster3D::hires_for), picked with it
+    mutable u32 hscale = 1;
     bool gpu = false, allow_lag = true;
     u64 gen = 0;
     u64 gpu_gen = 0;   // the GPU submit this frame was rendered with (Raster3D::frame_ready)
@@ -461,6 +469,8 @@ private:
   std::unique_ptr<Raster3D> lean_retired_;   // the Lean gpu_rebuild() replaced, kept one frame for readers of its record
   bool lean_aa_ = false;   // the AA setting lean_ was created for (msaa() is what the device granted)
   bool lean_edges_ = false;   // lean_ draws the edge plane (in place of MSAA)
+  u32 gpu_scale_ = 1, lean_scale_ = 1;   // the internal resolution asked for; the one lean_ was created for
+  u32 lean_want_scale() const { return gpu_edges() ? 1 : gpu_scale_; }   // the edge cut is 1x only
   bool gpu_edges() const { return aa_ && edge_export_; }   // the GPU raster's AA is the edge cut
   void gpu_rebuild();
   // The GPU submit (command recording + queue call, ~0.9 ms) runs on its own
