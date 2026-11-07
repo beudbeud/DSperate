@@ -39,6 +39,9 @@ struct Lean::Impl {
   EGLSurface surf = nullptr;
   bool edges = false, timing = false, indexed = false, egl_sync = false, nostencil = false, wclip = false, span_exact = false;
   static constexpr u32 kSlots = 4;
+  // The draw's size: 256x192 times `scale` (W x H stay the record's). Above
+  // 1x the full record also leaves (hi), and the 1x record is its nearest blit (t_res1).
+  u32 scale = 1, RW = W, RH = H;
   // Host staging as the Vulkan raster has it; the slot's device copies are
   // the persistently mapped buffers below (and the vertex stage's textures).
   std::vector<GpuPoly> host_polys, sorted;
@@ -50,10 +53,11 @@ struct Lean::Impl {
   GLuint ssbo_polys[kSlots] = {}, ssbo_spans[kSlots] = {}, ssbo_post[kSlots] = {}, ubo_frame[kSlots] = {}, ssbo_texels = 0;
   void* map_polys[kSlots] = {}; void* map_spans[kSlots] = {}; void* map_post[kSlots] = {}; void* map_frame[kSlots] = {}; u32* map_texels = nullptr;
   GLuint tex_polys[kSlots] = {}, tex_verts[kSlots] = {};
-  GLuint t_col = 0, t_fog = 0, t_ids = 0, t_ds = 0, t_ebyte = 0, t_res = 0;
-  GLuint fbo_draw = 0, fbo_edge = 0, fbo_res = 0;
-  GLuint pbo_out[kSlots] = {}, pbo_edge[kSlots] = {};
-  const u32* map_out[kSlots] = {}; const u8* map_edge[kSlots] = {};
+  GLuint t_col = 0, t_fog = 0, t_ids = 0, t_ds = 0, t_ebyte = 0, t_res = 0, t_res1 = 0;
+  GLuint fbo_draw = 0, fbo_edge = 0, fbo_res = 0, fbo_res1 = 0;
+  GLuint pbo_out[kSlots] = {}, pbo_edge[kSlots] = {}, pbo_hi[kSlots] = {};
+  const u32* map_out[kSlots] = {}; const u8* map_edge[kSlots] = {}; const u32* map_hi[kSlots] = {};
+  std::vector<u32> hi_host[kSlots];   // the full record copied out (scale > 1)
   // The record and the edge bytes copied out of the mapped PBOs (uncached memory on Mali) into host memory the compositor can read (finish_slot).
   std::vector<u32> out_host[kSlots];
   std::vector<u8> edge_bytes[kSlots];
@@ -99,6 +103,11 @@ struct Lean::Impl {
   // (20-45 ms stalls on the G31). The polygon texture holds zeros: nothing is drawn.
   void warm();
 
+  void copy_out(u32 slot) {
+    std::memcpy(out_host[slot].data(), map_out[slot], sizeof(u32) * W * H);
+    if (scale > 1) std::memcpy(hi_host[slot].data(), map_hi[slot], sizeof(u32) * RW * RH);
+    if (edges) { const u8* e = map_edge[slot]; u8* o = edge_bytes[slot].data(); for (u32 k = 0; k < W * H; ++k) o[k] = e[4 * k]; }
+  }
   // The collector: frames in submit order, each waited and copied out.
   void collect_loop() {
     std::unique_lock<std::mutex> lk(m);
@@ -110,8 +119,7 @@ struct Lean::Impl {
       EGLSyncKHR sy = sync[slot];
       lk.unlock();
       if (sy) a->eglClientWaitSyncKHR(dpy, sy, 0, EGL_FOREVER_KHR);
-      std::memcpy(out_host[slot].data(), map_out[slot], sizeof(u32) * W * H);
-      if (edges) { const u8* e = map_edge[slot]; u8* o = edge_bytes[slot].data(); for (u32 k = 0; k < W * H; ++k) o[k] = e[4 * k]; }
+      copy_out(slot);
       lk.lock();
       live[slot] = false; valid[slot] = true; collected = g;
       cv.notify_all();
@@ -128,16 +136,16 @@ struct Lean::Impl {
       for (auto& row : prog_draw) for (GLuint p : row) if (p) a->glDeleteProgram(p);
       for (GLuint p : {prog_prep, prog_mask, prog_resolve, prog_band, prog_cutout}) if (p) a->glDeleteProgram(p);
       for (u32 i = 0; i < kSlots; ++i) {
-        GLuint bufs[6] = {ssbo_polys[i], ssbo_spans[i], ssbo_post[i], ubo_frame[i], pbo_out[i], pbo_edge[i]};
-        a->glDeleteBuffers(6, bufs);
+        GLuint bufs[7] = {ssbo_polys[i], ssbo_spans[i], ssbo_post[i], ubo_frame[i], pbo_out[i], pbo_edge[i], pbo_hi[i]};
+        a->glDeleteBuffers(7, bufs);
         GLuint texs[2] = {tex_polys[i], tex_verts[i]};
         a->glDeleteTextures(2, texs);
       }
       if (ssbo_texels) a->glDeleteBuffers(1, &ssbo_texels);
-      GLuint texs[6] = {t_col, t_fog, t_ids, t_ds, t_ebyte, t_res};
-      a->glDeleteTextures(6, texs);
-      GLuint fbos[3] = {fbo_draw, fbo_edge, fbo_res};
-      a->glDeleteFramebuffers(3, fbos);
+      GLuint texs[7] = {t_col, t_fog, t_ids, t_ds, t_ebyte, t_res, t_res1};
+      a->glDeleteTextures(7, texs);
+      GLuint fbos[4] = {fbo_draw, fbo_edge, fbo_res, fbo_res1};
+      a->glDeleteFramebuffers(4, fbos);
       if (vao) a->glDeleteVertexArrays(1, &vao);
       if (timing && a->glDeleteQueriesEXT) a->glDeleteQueriesEXT(kSlots, query);
       a->eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -160,6 +168,12 @@ bool Lean::has_frame() const { return d_->gen != 0; }
 u64 Lean::gpu_ns() const { return d_->last_gpu_ns; }
 u32 Lean::draws() const { return d_->last_draws; }
 Lean::Stats Lean::stats(bool reset) { std::lock_guard<std::mutex> lk(d_->m); Stats s = d_->st; if (reset) d_->st = Stats{}; return s; }
+const u32* Lean::hires_for(const u32* o, u32* scale) const {
+  if (scale) *scale = 1;
+  if (d_->scale == 1) return nullptr;
+  for (u32 i = 0; i < Impl::kSlots; ++i) if (o == d_->out_host[i].data()) { if (scale) *scale = d_->scale; return d_->hi_host[i].data(); }
+  return nullptr;
+}
 const u8* Lean::edges_for(const u32* o) const {
   if (!d_->edges) return nullptr;
   for (u32 i = 0; i < Impl::kSlots; ++i) if (o == d_->out_host[i].data()) return d_->edge_bytes[i].data();
@@ -225,7 +239,7 @@ void* persistent(Api& a, GLenum target, GLuint* buf, size_t size, bool read) {
 }
 }
 
-std::unique_ptr<Lean> Lean::create(bool aa, bool edges, std::string* why) {
+std::unique_ptr<Lean> Lean::create(bool aa, bool edges, u32 scale, std::string* why) {
   (void)aa;   // no MSAA on this backend: the edge cut is its AA
   auto fail_null = [&](const char* m) { if (why) *why = m; return nullptr; };
   if (std::getenv("DS_GL3D") && std::atoi(std::getenv("DS_GL3D")) == 0) return fail_null("disabled (DS_GL3D=0)");
@@ -235,7 +249,10 @@ std::unique_ptr<Lean> Lean::create(bool aa, bool edges, std::string* why) {
   self->d_ = std::make_unique<Impl>();
   Impl& d = *self->d_;
   d.a = &a; d.edges = edges;
+  d.scale = std::clamp(scale, 1u, 4u); d.RW = W * d.scale; d.RH = H * d.scale;
   auto fail = [&](const char* m) { if (why) { *why = m; if (a.glGetError) { const GLenum e = a.glGetError(); if (e) *why += " (GL error " + std::to_string(e) + ")"; } } return nullptr; };
+  if (d.edges && d.scale > 1) return fail("edge cut at a scale above 1");
+  if (d.scale > 1 && !a.glBlitFramebuffer) return fail("no glBlitFramebuffer for the scaled record");
 
   // EGL: the default display, an ES 3.1 context on no surface (a 1x1
   // pbuffer where the driver wants one). The display is initialised once
@@ -298,6 +315,11 @@ std::unique_ptr<Lean> Lean::create(bool aa, bool edges, std::string* why) {
     d.map_out[i] = static_cast<const u32*>(persistent(a, GL_PIXEL_PACK_BUFFER, &d.pbo_out[i], sizeof(u32) * W * H, true));
     if (!d.map_polys[i] || !d.map_spans[i] || !d.map_post[i] || !d.map_frame[i] || !d.map_out[i]) return fail("buffer mapping");
     d.out_host[i].assign(W * H, 0);
+    if (d.scale > 1) {
+      d.map_hi[i] = static_cast<const u32*>(persistent(a, GL_PIXEL_PACK_BUFFER, &d.pbo_hi[i], sizeof(u32) * d.RW * d.RH, true));
+      if (!d.map_hi[i]) return fail("scaled record mapping");
+      d.hi_host[i].assign(d.RW * d.RH, 0);
+    }
     if (d.edges) {
       d.map_edge[i] = static_cast<const u8*>(persistent(a, GL_PIXEL_PACK_BUFFER, &d.pbo_edge[i], 4 * W * H, true));
       if (!d.map_edge[i]) return fail("edge buffer mapping");
@@ -311,13 +333,14 @@ std::unique_ptr<Lean> Lean::create(bool aa, bool edges, std::string* why) {
 
   // Attachments: colour, fog bit, the polygon record (edges), depth/stencil;
   // the edge bytes; the resolved record. Float depth first, as vk_lean.cpp.
-  d.t_col = tex2d(a, GL_RGBA8, W, H);
-  d.t_fog = tex2d(a, GL_R8, W, H);
+  // At the draw's size (the edge planes only at 1x).
+  d.t_col = tex2d(a, GL_RGBA8, d.RW, d.RH);
+  d.t_fog = tex2d(a, GL_R8, d.RW, d.RH);
   if (d.edges) { d.t_ids = tex2d(a, GL_R16UI, W, H); d.t_ebyte = tex2d(a, GL_RGBA8, W, H); }
-  d.t_res = tex2d(a, GL_RGBA8, W, H);
+  d.t_res = tex2d(a, GL_RGBA8, d.RW, d.RH);
   const bool d24 = std::getenv("DS_LEAN_D24") && std::atoi(std::getenv("DS_LEAN_D24")) != 0;
   for (int attempt = d24 ? 1 : 0; attempt < 2 && !d.fbo_draw; ++attempt) {
-    GLuint ds = tex2d(a, attempt == 0 ? GL_DEPTH32F_STENCIL8 : GL_DEPTH24_STENCIL8, W, H);
+    GLuint ds = tex2d(a, attempt == 0 ? GL_DEPTH32F_STENCIL8 : GL_DEPTH24_STENCIL8, d.RW, d.RH);
     GLuint fbo = 0; a.glGenFramebuffers(1, &fbo); a.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.t_col, 0);
     a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + 1, GL_TEXTURE_2D, d.t_fog, 0);
@@ -332,6 +355,12 @@ std::unique_ptr<Lean> Lean::create(bool aa, bool edges, std::string* why) {
   a.glGenFramebuffers(1, &d.fbo_res); a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_res);
   a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.t_res, 0);
   if (a.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return fail("resolve framebuffer incomplete");
+  if (d.scale > 1) {
+    d.t_res1 = tex2d(a, GL_RGBA8, W, H);
+    a.glGenFramebuffers(1, &d.fbo_res1); a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_res1);
+    a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.t_res1, 0);
+    if (a.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return fail("1x record framebuffer incomplete");
+  }
   if (d.edges) {
     a.glGenFramebuffers(1, &d.fbo_edge); a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_edge);
     a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.t_ebyte, 0);
@@ -401,7 +430,7 @@ std::unique_ptr<Lean> Lean::create(bool aa, bool edges, std::string* why) {
   if (a.glGetError() != GL_NO_ERROR) return fail("GL error during warm-up");
   if (d.egl_sync) d.collector = std::thread([&d] { d.collect_loop(); });
   self->ready_ = true;
-  std::fprintf(stderr, "gpu lean (OpenGL ES): %s | %s; 1x%s, %s depth/stencil%s%s%s; warm-up %.0f ms\n", a.glGetString(GL_RENDERER), a.glGetString(GL_VERSION), d.edges ? " with the edge cut" : " (no MSAA)",
+  std::fprintf(stderr, "gpu lean (OpenGL ES): %s | %s; %ux%s, %s depth/stencil%s%s%s; warm-up %.0f ms\n", a.glGetString(GL_RENDERER), a.glGetString(GL_VERSION), d.scale, d.edges ? " with the edge cut" : " (no MSAA)",
                d24 ? "D24S8" : "D32S8", d.span_exact ? ", exact spans" : "", d.indexed ? "" : ", no per-attachment blend", d.egl_sync ? "" : ", no EGL fences (frames finish synchronously)", now_ms() - t_warm);
   return self;
 }
@@ -475,7 +504,7 @@ void Lean::Impl::warm() {
   g.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo_spans[0]);
   g.glBindVertexArray(vao);
   g.glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
-  g.glViewport(0, 0, W, H);
+  g.glViewport(0, 0, RW, RH);
   g.glEnable(GL_STENCIL_TEST);
   for (u32 wd = 0; wd < 2; ++wd)
     for (u32 kind = 0; kind < P_COUNT; ++kind) {
@@ -525,6 +554,7 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
   }
 
   GpuFrame f = fin;
+  f.scale = d.scale;
   const bool wbuf = (f.flags & DS_FF_WBUFFER) != 0;
   // The clip z of a W-buffered frame carries wscale / w (gl_pull.glsl, ds_clip_z).
   f.wscale = 0x3F800000u;   // 1.0f
@@ -547,6 +577,8 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     for (u32 v = 0; v < p.nverts; ++v) { const GpuVert& q = gv[p.first_vert + v]; s0 = std::min(s0, q.s); s1 = std::max(s1, q.s); t0 = std::min(t0, q.t); t1 = std::max(t1, q.t); cx += q.fx; cy += q.fy; }
     auto pk = [](s32 lo, s32 hi) { return static_cast<u32>(std::clamp(lo + 32768, 0, 65535)) | (static_cast<u32>(std::clamp(hi + 32768, 0, 65535)) << 16); };
     p.row_base = pk(s0, s1); p.pad_ = pk(t0, t1);
+    // The span table holds one DS pixel's attributes; above 1x the hardware's interpolation gives each sample its own texel (vk_lean.cpp).
+    if (d.scale > 1) p.span_base = DS_SPAN_NONE;
     if (p.nverts) { cx /= static_cast<s32>(p.nverts); cy /= static_cast<s32>(p.nverts); }
     p.vbot = (static_cast<u32>(std::clamp(cx, -32768, 32767)) & 0xFFFF) | (static_cast<u32>(std::clamp(cy, -32768, 32767)) << 16);
   }
@@ -597,7 +629,7 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
   const double t_rec = now_ms();
   if (d.timing) a.glBeginQueryEXT(GL_TIME_ELAPSED_EXT, d.query[slot]);
   a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_draw);
-  a.glViewport(0, 0, W, H);
+  a.glViewport(0, 0, d.RW, d.RH);
   a.glDisable(GL_SCISSOR_TEST); a.glDisable(GL_CULL_FACE); a.glDisable(GL_DITHER);
   // Clear: the rear plane's colour and alpha; depth; stencil drawn where the rear plane has alpha; the fog bit; no record.
   {
@@ -703,8 +735,17 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
   a.glUseProgram(d.prog_resolve); d.bound_prog = d.prog_resolve;
   a.glDrawArrays(GL_TRIANGLES, 0, 3); ++draws;
   a.glPixelStorei(GL_PACK_ALIGNMENT, 4);
-  a.glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pbo_out[slot]);
   a.glReadBuffer(GL_COLOR_ATTACHMENT0);
+  if (d.scale > 1) {
+    // The full record out, then its nearest blit to 1x (vk_lean.cpp's res1), which the 1x readback takes.
+    a.glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pbo_hi[slot]);
+    a.glReadPixels(0, 0, static_cast<GLsizei>(d.RW), static_cast<GLsizei>(d.RH), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    a.glBindFramebuffer(GL_READ_FRAMEBUFFER, d.fbo_res); a.glBindFramebuffer(GL_DRAW_FRAMEBUFFER, d.fbo_res1);
+    a.glBlitFramebuffer(0, 0, static_cast<GLint>(d.RW), static_cast<GLint>(d.RH), 0, 0, W, H, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_res1);
+    a.glReadBuffer(GL_COLOR_ATTACHMENT0);
+  }
+  a.glBindBuffer(GL_PIXEL_PACK_BUFFER, d.pbo_out[slot]);
   a.glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
   if (d.edges) {
     a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_edge);
@@ -729,7 +770,7 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     d.last_draws = draws;
     if (wbuf) ++d.st.wbuf;
     // No fence: finished here (glFinish); copied out on this thread.
-    if (!sync) { d.valid[slot] = true; std::memcpy(d.out_host[slot].data(), d.map_out[slot], sizeof(u32) * W * H); if (d.edges) for (u32 k = 0; k < W * H; ++k) d.edge_bytes[slot][k] = d.map_edge[slot][4 * k]; }
+    if (!sync) { d.valid[slot] = true; d.copy_out(slot); }
     ++d.gen;
     if (!sync) d.collected = d.gen;
   }

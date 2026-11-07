@@ -42,7 +42,8 @@ namespace ds::gpu::gl {
 class Lean final : public Raster3D {
 public:
   // `edges`: the edge cut (the GL raster's AA; `aa` without it draws plain: no MSAA here).
-  static std::unique_ptr<Lean> create(bool aa, bool edges, std::string* why = nullptr);
+  // `scale` (1-4, not with `edges`): the draw at 256x192 times it, the 1x record its nearest blit (hires_for).
+  static std::unique_ptr<Lean> create(bool aa, bool edges, u32 scale = 1, std::string* why = nullptr);
   ~Lean() override;
   Lean(const Lean&) = delete;
   Lean& operator=(const Lean&) = delete;
@@ -62,6 +63,7 @@ public:
   const u32* output() override;
   const u32* frame_ready(u64 gen, bool allow_lag) override;
   const u8* edges_for(const u32* out) const override;
+  const u32* hires_for(const u32* out, u32* scale) const override;
   bool has_frame() const override;
   void forget() override;
   u64 gpu_ns() const override;

@@ -21,7 +21,7 @@ public:
   // `aa`: video.aa for the GPU raster (4x MSAA on Vulkan where the device
   // has it); `edges`: the edge cut instead (core/gpu/edge_cut.h): 1 sample,
   // and beside each record the edge plane of the drawn polygons (edges_for).
-  // `scale`: the internal resolution (1-4); above 1 only Vulkan draws it (see hires_for).
+  // `scale`: the internal resolution (1-4); the record also at that size (see hires_for).
   static std::unique_ptr<Raster3D> create(bool aa, bool edges, u32 scale = 1, std::string* why = nullptr);
 
   virtual bool ready() const = 0;
@@ -69,7 +69,7 @@ public:
   // pixel's colour is the record's); null without edges.
   virtual const u8* edges_for(const u32* out) const = 0;
   // The record drawn at the internal resolution beside 1x record `out` (256*scale x
-  // 192*scale words, the same layout), and its scale; null at 1x or on a backend without it.
+  // 192*scale words, the same layout), and its scale; null at 1x.
   virtual const u32* hires_for(const u32*, u32* scale) const { if (scale) *scale = 1; return nullptr; }
   virtual bool has_frame() const = 0;
   // A save state was loaded: every finished frame belongs to the session it
