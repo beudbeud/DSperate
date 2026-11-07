@@ -154,7 +154,29 @@ static void test_final_pass() {
   }
 }
 
+// The internal-resolution row scrolls with the 3D layer (BG0HOFS), in samples.
+static void test_hires_line_scroll() {
+  NDS nds;
+  power_on(nds);
+  u32 rec[512 * 384];   // a 2x record: each sample its own x
+  for (u32 y = 0; y < 384; ++y) for (u32 x = 0; x < 512; ++x) rec[y * 512 + x] = x + 1;
+  gpu::Renderer3D::FrameRef f;
+  f.hires = rec; f.hscale = 2;
+  u32 n = 0;
+  const u32* r = nds.gpu3d.hires_line(f, 5, 1, &n);
+  CHECK(r && n == 2 && r[0] == 1 && r[511] == 512);
+  nds.gpu3d.set_render_xpos(3, 0x1FF);                       // 3 DS pixels left
+  r = nds.gpu3d.hires_line(f, 5, 1, &n);
+  CHECK(r[0] == 7 && r[505] == 512 && r[506] == 0 && r[511] == 0);
+  nds.gpu3d.set_render_xpos(0x1FE, 0x1FF);                   // -2: 2 DS pixels right
+  r = nds.gpu3d.hires_line(f, 5, 1, &n);
+  CHECK(r[3] == 0 && r[4] == 1 && r[511] == 508);
+  f.hires = nullptr;
+  CHECK(!nds.gpu3d.hires_line(f, 5, 1, &n));
+}
+
 int main() {
+  test_hires_line_scroll();
   test_gxstat_synthesis();
   test_gxstat_swap_busy();
   test_matrix_stack();

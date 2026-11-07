@@ -436,7 +436,47 @@ static void test_bilinear() {
   }
 }
 
+// The internal-resolution output: each 3D sample is composed with the 1x
+// pixel's layers, so a silhouette edge falls between the samples of one DS
+// pixel, and the layer under the 3D shows where a sample is empty.
+static void test_hires_compose() {
+  NDS nds;
+  nds.io.powcnt1 = 0x820F; nds.gpu.set_powcnt(0x820F);
+  write9(nds, 0x04000000, 32, 0x00010108);                   // mode 0, 3D on BG0, BG0 on, display mode 1
+  w16(nds, 0x05000000, 0x7C00);                              // backdrop: blue
+  const gpu::Pixel green = 0x1F003F00u, blue = rgb18(0x7C00);
+  alignas(16) gpu::Pixel line3d[256] = {};
+  line3d[10] = green;                                        // 3D at 1x on pixel 10 only
+  alignas(16) u32 hi[512] = {};                              // its 2x row: 20 and 23 drawn, 21 and 22 empty
+  hi[20] = green; hi[23] = green;
+  gpu::Engine2D& en = nds.gpu.engine[0];
+  en.set_hires(true);
+  en.set_3d_line(line3d);
+  render_a(nds, 0);
+  alignas(16) gpu::Pixel out[512];
+  CHECK(en.compose3d_hires(hi, 2, out));
+  CHECK_EQ(out[20] & 0xFFFFFF, green & 0xFFFFFF);            // 3D on top at 1x, drawn here
+  CHECK_EQ(out[21] & 0xFFFFFF, blue);                        // 3D on top at 1x, empty here: the backdrop under it
+  CHECK_EQ(out[22] & 0xFFFFFF, blue);                        // backdrop at 1x, empty here
+  CHECK_EQ(out[23] & 0xFFFFFF, green & 0xFFFFFF);            // backdrop at 1x, the 3D reaches this sample
+  CHECK_EQ(out[0] & 0xFFFFFF, blue);
+  // A fade on BG0 reaches every 3D sample, and only those.
+  w16(nds, 0x04000050, 0x00C1);                              // darken, target BG0
+  w16(nds, 0x04000054, 16);
+  render_a(nds, 0);
+  CHECK(en.compose3d_hires(hi, 2, out));
+  CHECK_EQ(out[20] & 0xFFFFFF, 0u);
+  CHECK_EQ(out[23] & 0xFFFFFF, 0u);
+  CHECK_EQ(out[21] & 0xFFFFFF, blue);
+  // Off: lines resolve as before and nothing is recomposed.
+  en.set_hires(false);
+  w16(nds, 0x04000050, 0);
+  render_a(nds, 0);
+  CHECK(!en.compose3d_hires(hi, 2, out));
+}
+
 int main() {
+  test_hires_compose();
   test_vram_views();
   test_text_bg_and_backdrop();
   test_sprites_and_window();

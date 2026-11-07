@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
   if (!dev) { std::fprintf(stderr, "no Vulkan device: %s\n", why.c_str()); return 1; }
   std::printf("device: %s (graphics %d, msaa4 %d, int64 atomics %d, timestamps %s)\n", dev->name().c_str(), (int)dev->limits().graphics, (int)dev->limits().msaa4,
               (int)dev->limits().int64_atomics, dev->limits().timestamp_period_ns > 0 ? "yes" : "no");
-  std::unique_ptr<Lean> L = Lean::create(dev, std::getenv("DS_VK_MSAA") && std::atoi(std::getenv("DS_VK_MSAA")) != 0, std::getenv("DS_VK_EDGES") && std::atoi(std::getenv("DS_VK_EDGES")) != 0, &why);
+  std::unique_ptr<Lean> L = Lean::create(dev, std::getenv("DS_VK_MSAA") && std::atoi(std::getenv("DS_VK_MSAA")) != 0, std::getenv("DS_VK_EDGES") && std::atoi(std::getenv("DS_VK_EDGES")) != 0, std::getenv("DS_LEAN_SCALE") ? static_cast<u32>(std::atoi(std::getenv("DS_LEAN_SCALE"))) : 1u, &why);
   if (!L || !L->ready()) { std::fprintf(stderr, "GPU raster unavailable: %s\n", why.c_str()); return 1; }
 
   auto upload = [&]() {
@@ -106,11 +106,14 @@ int main(int argc, char** argv) {
   std::printf("submit+wait per frame: median %.2f ms, p90 %.2f, p99 %.2f, max %.2f (%d frames, %.1f ms total)\n", q(0.5), q(0.9), q(0.99), ms.back(), iters, total);
   if (ppm) {
     const u32 S = L->scale();
-    const u32* out = L->output();
+    const u32* out1 = L->output();
+    u32 hs = 1;
+    const u32* hi = L->hires_for(out1, &hs);
+    const u32* out = hi ? hi : out1;
     std::FILE* o = std::fopen(ppm, "wb");
     if (!o) { std::fprintf(stderr, "cannot write %s\n", ppm); return 1; }
     if (std::strlen(ppm) > 5 && !std::strcmp(ppm + std::strlen(ppm) - 5, ".edge")) {   // the edge plane (DS_VK_EDGES=1): one byte per pixel
-      const u8* e = L->edges_for(out);
+      const u8* e = L->edges_for(out1);
       if (!e) { std::fprintf(stderr, "no edge plane (DS_VK_EDGES=1?)\n"); return 1; }
       std::fwrite(e, 1, 256 * 192 * S * S, o); std::fclose(o); std::printf("wrote %s\n", ppm); return 0;
     }

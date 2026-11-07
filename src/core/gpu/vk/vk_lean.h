@@ -29,7 +29,8 @@ public:
   // `msaa`: 4x MSAA where the device has it (video.aa on the GPU raster); else 1 sample.
   // `edges`: the edge cut instead: 1 sample, and the edge plane beside each record.
   // The device is kept alive by the Lean.
-  static std::unique_ptr<Lean> create(std::shared_ptr<Device> dev, bool msaa, bool edges, std::string* why = nullptr);
+  // `scale`: the attachments at 256*scale x 192*scale (1-4); above 1, hires_for has the full record and output() a 1x blit of it.
+  static std::unique_ptr<Lean> create(std::shared_ptr<Device> dev, bool msaa, bool edges, u32 scale = 1, std::string* why = nullptr);
   ~Lean() override;
   Lean(const Lean&) = delete;
   Lean& operator=(const Lean&) = delete;
@@ -37,7 +38,7 @@ public:
   bool ready() const override { return ready_; }
   const char* api() const override { return "Vulkan"; }
   bool msaa() const override;
-  u32 scale() const;   // the attachment scale (DS_LEAN_SCALE, probe-only): the record is 256*scale x 192*scale
+  u32 scale() const;   // the attachment scale (create's `scale`)
   bool edges() const override;
   GpuPoly* poly_buffer() override;
   GpuVert* vert_buffer() override;
@@ -50,6 +51,7 @@ public:
   const u32* output() override;
   const u32* frame_ready(u64 gen, bool allow_lag) override;
   const u8* edges_for(const u32* out) const override;
+  const u32* hires_for(const u32* out, u32* scale) const override;
   bool has_frame() const override;
   void forget() override;
   u64 gpu_ns() const override;

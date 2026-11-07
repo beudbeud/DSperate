@@ -1227,6 +1227,27 @@ const u32* Gpu3D::line(const Renderer3D::FrameRef& f, u32 y) {
   return scrolled;
 }
 
+const u32* Gpu3D::hires_line(const Renderer3D::FrameRef& f, u32 y, u32 sub, u32* scale) {
+  if (!f.hires || f.hscale > 4) return nullptr;
+  const u32 n = f.hscale, w = 256 * n;
+  const u32* raw = f.hires + (y * n + sub) * w;
+  *scale = n;
+  // The same scroll as line(), in samples: xpos is a 9-bit signed offset into the record.
+  const u32 xpos = render_xpos_;
+  u32* const out = hires_row_;
+  if (xpos == 0) std::memcpy(out, raw, w * sizeof(u32));
+  else if (xpos & 0x100) {
+    const u32 lead = (512 - xpos) * n;
+    std::memset(out, 0, lead * sizeof(u32));
+    std::memcpy(out + lead, raw, (w - lead) * sizeof(u32));
+  } else {
+    const u32 skip = xpos * n;
+    std::memcpy(out, raw + skip, (w - skip) * sizeof(u32));
+    std::memset(out + (w - skip), 0, skip * sizeof(u32));
+  }
+  return out;
+}
+
 // ---- geometry worker ----------------------------------------------------------
 
 void Gpu3D::stack_reset() {

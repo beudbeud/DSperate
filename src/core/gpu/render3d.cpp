@@ -2889,7 +2889,7 @@ void Renderer3D::render(const Gpu3D& gx) {
   texels_in_ = &poly_texels_;
   if (gpu_dump_path_ && nds_.frame_count >= gpu_dump_frame_) gpu_dump(gx, polys, npoly);   // the first frame rendered at or after the one asked for (identical lists are skipped above)
   lean_retired_.reset();
-  if (gpu_on_ && lean_ && (lean_aa_ != aa_ || lean_edges_ != gpu_edges())) gpu_rebuild();
+  if (gpu_on_ && lean_ && (lean_aa_ != aa_ || lean_edges_ != gpu_edges() || lean_scale_ != lean_want_scale())) gpu_rebuild();
   if (gpu_on_ && gpu_submit(gx, polys, npoly)) { gpu_frame_ = true; ++gpu_gen_; pending_bands_ = 0; return; }
   gpu_frame_ = false;
   if (prof::enabled && !prep_done) { prof::add_timed(prof::R3D_PREP, prof::now_ns() - t_prep0); prep_done = true; }
@@ -3090,14 +3090,14 @@ void Renderer3D::set_aa(bool on) {
 void Renderer3D::gpu_rebuild() {
   sync_all(); gpu_job_wait(); lean_->wait_all();
   std::string why;
-  std::unique_ptr<Raster3D> fresh = Raster3D::create(aa_, gpu_edges(), &why);
+  std::unique_ptr<Raster3D> fresh = Raster3D::create(aa_, gpu_edges(), lean_want_scale(), &why);
   lean_retired_ = std::move(lean_);
   if (!fresh || !fresh->ready()) {
     std::fprintf(stderr, "gpu3d: rebuild for AA %s failed (%s), drawing on the CPU\n", aa_ ? "on" : "off", why.c_str());
     gpu_on_ = false;
     return;
   }
-  lean_ = std::move(fresh); lean_aa_ = aa_; lean_edges_ = gpu_edges();
+  lean_ = std::move(fresh); lean_aa_ = aa_; lean_edges_ = gpu_edges(); lean_scale_ = lean_want_scale();
   gpu_resident_.clear(); gpu_arena_top_ = 0; gpu_gen_ = 0;
 }
 
@@ -3107,7 +3107,7 @@ bool Renderer3D::set_gpu(bool on, std::string* why) {
   if (!on) { sync_all(); gpu_job_wait(); if (lean_) lean_->wait(); gpu_on_ = false; return true; }
   if (gpu_on_) return true;
   std::string reason;
-  if (!lean_) { lean_ = Raster3D::create(aa_, gpu_edges(), &reason); lean_aa_ = aa_; lean_edges_ = gpu_edges(); }
+  if (!lean_) { lean_ = Raster3D::create(aa_, gpu_edges(), lean_want_scale(), &reason); lean_aa_ = aa_; lean_edges_ = gpu_edges(); lean_scale_ = lean_want_scale(); }
   if (!lean_ || !lean_->ready()) { lean_.reset(); if (why) *why = reason; return false; }
   lean_->wait_all(); gpu_resident_.clear(); gpu_arena_top_ = 0;
   gpu_job_start();
@@ -3376,6 +3376,7 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
       f.out = lean_ ? lean_->frame_ready(f.gpu_gen, f.allow_lag) : nullptr;
       if (!f.out) { gpu_job_wait(); f.out = lean_ ? lean_->frame_ready(f.gpu_gen, f.allow_lag) : nullptr; }
       f.edge_bytes = f.out ? lean_->edges_for(f.out) : nullptr;
+      f.hires = f.out ? lean_->hires_for(f.out, &f.hscale) : nullptr;
       if (!f.out) f.out = out_[display_].data();   // a Lean with no frame yet: a stale picture, not a null read
       if (g_gpu_trace.on) { const double w = now_ms() - t0; g_gpu_trace.wait_ms += w; g_gpu_trace.wait_max = std::max(g_gpu_trace.wait_max, w); if (w > 0.2) ++g_gpu_trace.waited; }
     }

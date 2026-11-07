@@ -293,9 +293,44 @@ bool Engine2D::edge_compose(Pixel* own, u8* bytes) const {
   return any;
 }
 
+bool Engine2D::compose3d_hires(const u32* h, u32 n, Pixel* dst) const {
+  if (!hires_composable()) return false;
+  const u32 p3d = cur_.bgcnt[0] & 3, effect = (cur_.bldcnt >> 6) & 3;
+  // No colour effect on BG0: an opaque 3D sample is shown as it is (most samples of most lines).
+  const bool plain = !(cur_.bldcnt & L_BG0) || effect == 0;
+  auto behind_3d = [&](u32 x) {   // as edge_compose's: the top layer would be under an opaque 3D pixel
+    const u8 t = top_tid_[x];
+    if (t == T_BACKDROP) return true;
+    if (t >= T_BG1 && t <= T_BG3) return (cur_.bgcnt[t] & 3u) >= p3d;
+    if (t >= T_OBJ_STD && t <= T_OBJ_DIRECT) return (obj_attr_[x] & OA_PRIO) > p3d;
+    return false;
+  };
+  for (u32 x = 0; x < 256; ++x) {
+    Pixel* const o = dst + x * n;
+    const u32* const s = h + x * n;
+    const bool top3d = top_tid_[x] == T_BG0;
+    if (!top3d && !((win_[x] & 1) && behind_3d(x))) { for (u32 k = 0; k < n; ++k) o[k] = out_[x]; continue; }
+    for (u32 k = 0; k < n; ++k) {
+      const Pixel p = s[k];
+      if (plain && ((p >> 24) & 0x1F) == 31) { o[k] = (p & 0x00FFFFFF) | 0xFF000000; continue; }
+      if ((p >> 24) & 0x1F) {
+        // The 3D sample on top: over the 1x pixel's second layer, or over its top one where 3D was empty at 1x.
+        o[k] = top3d ? kern::ref::composite_pixel(cur_.bldcnt, cur_.eva, cur_.evb, cur_.evy, p, second_[x], top_id_[x], K_3D, top_alpha_[x], second_id_[x], win_[x])
+                     : kern::ref::composite_pixel(cur_.bldcnt, cur_.eva, cur_.evb, cur_.evy, p, top_[x], L_BG0, K_3D, 0, top_id_[x], win_[x]);
+      } else if (top3d) {
+        // Empty here though the 1x pixel had 3D: the layer under it, with its own fade.
+        const Pixel b = second_[x];
+        o[k] = effect >= 2 ? kern::ref::fade_pixel(cur_.bldcnt, cur_.evy, b, second_id_[x], win_[x]) : (b & 0x00FFFFFF) | 0xFF000000;
+      } else o[k] = out_[x];
+    }
+  }
+  return true;
+}
+
 // Whether any pixel of the line could be changed by the colour-effects pass.
 // Conservative: presence is checked per line, not per pixel.
 bool Engine2D::effect_possible() const {
+  if (hires_line()) return true;   // compose3d_hires needs the full path's records
   u32 present = L_BACKDROP;
   for (int n = 0; n < 4; ++n) if (bg_[n].any) present |= 1u << n;
   const bool objs = (cur_.layer_enable & 0x10) && num_sprites_;
@@ -1042,6 +1077,7 @@ void Engine2D::select_layers() {
 // layers never looks below the top pixel, so nothing under it need be
 // resolved.
 bool Engine2D::needs_second() const {
+  if (hires_line()) return true;
   if (((cur_.bldcnt >> 6) & 3) == 1) return true;
   if (!num_ && (cur_.dispcnt & 8) && bg_[0].any && kern::active::line_has_translucent_3d(line3d_)) return true;
   if ((cur_.layer_enable & 0x10) && num_sprites_) {

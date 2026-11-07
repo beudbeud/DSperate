@@ -118,6 +118,20 @@ public:
   const u32* edge_plane(int screen) const { return edge_fb_[screen].data(); }
   const u64* edge_rows(int screen) const { return edge_rows_[screen]; }
 
+  // The internal resolution (1-4): above 1 the GPU 3D raster draws at n
+  // times the DS's, and beside each screen's frame a second one at 256n x
+  // 192n (0xAARRGGBB as framebuffer) holds the lines that show the 3D layer
+  // at that resolution, the 2D layers pixel-repeated. hires_rows says which
+  // DS lines it holds (one bit a line); the others are the framebuffer's,
+  // to be enlarged by the frontend. Only the 3D layer's live display gains
+  // (a captured image shows at 1x), and only from the Vulkan raster. The
+  // emulation, framebuffer and captures are unchanged. Frontend side; set
+  // between frames.
+  void set_hires(u32 n);
+  u32 hires() const { return hires_n_; }
+  const u32* hires_frame(int screen) const { return hires_n_ > 1 ? hires_fb_[screen].data() : nullptr; }
+  bool hires_row(int screen, u32 line) const { return hires_n_ > 1 && ((hires_rows_[screen][line >> 6] >> (line & 63)) & 1); }
+
   // A screen the frontend does not show. Its driving engine skips drawing but
   // keeps journal/latches/windows/lazy-2D bookkeeping running so it's exact
   // once shown again. Engine A never skips. Set between frames only.
@@ -249,6 +263,10 @@ private:
   std::vector<u32> prev_fb_[2], prev_edge_[2];
   u64 prev_rows_[2][3] = {};
   void output_edges(const Engine2D& en, int screen, u32 line, const u32* shown);
+  u32 hires_n_ = 1;
+  std::vector<u32> hires_fb_[2];   // hires_frame
+  u64 hires_rows_[2][3] = {};   // hires_row
+  void output_hires(const Engine2D& en, int screen, u32 line);
   void capture_edges(u32 cnt, u32 line, u32 width, u32 dst_bank, u32 lcdc);
   std::shared_ptr<const kern::ColourLut> colour_lut_;   // null: off
   ColourProfile colour_ = ColourProfile::Off;
