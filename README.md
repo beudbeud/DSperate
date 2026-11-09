@@ -1,6 +1,20 @@
-# DSperate (Nintendo DS Emulator)
+# DSperate libretro (Nintendo DS libretro core)
 
-AI DISCLAIMER: Agentic coding is used here. A lot. I am not smart enough to keep track
+This is a **fork** of [beebono/DSperate](https://github.com/beebono/DSperate)
+that turns DSperate into a **libretro core** (`dsperate_libretro.so`) for
+RetroArch and Recalbox, tuned for the Raspberry Pi 4 and 5. The emulator
+itself is upstream's work and is rebased onto upstream `main` regularly; this
+fork adds the libretro frontend (`src/frontend/libretro/`) and the
+libretro-side features: GPU 3D on Vulkan or OpenGL ES, internal resolution up
+to 4x, an xBRZ 2D filter, save states with rewind and run-ahead, RetroArch
+cheats and RetroAchievements (Hardcore included). Build and core options:
+[libretro core](#libretro-core-retroarch-raspberry-pi-5). Bugs in the
+libretro core belong here, not upstream.
+
+The rest of this README, apart from the libretro section, is upstream's: it
+describes the emulator and its own SDL frontend, which this fork still builds.
+
+AI DISCLAIMER (upstream's): Agentic coding is used here. A lot. I am not smart enough to keep track
 of all of this with the wet electric meat lump that sits inside my skull.
 
 A Nintendo DS and DSi emulator that reimplements DraStic's JIT and NEON rendering
@@ -9,13 +23,6 @@ local wireless.
 Built for and measured on ARM handhelds (the Anbernic RG DS, an RK3566 with
 four A55 cores); commercial games boot and play. Everything is verified against
 melonDS with frame dumps and instruction traces.
-
-This branch also builds DSperate as a **libretro core** (`dsperate_libretro.so`)
-for RetroArch and Recalbox, tuned for the Raspberry Pi 4 and 5: GPU 3D on
-Vulkan or OpenGL ES, internal resolution up to 4x, an xBRZ 2D filter, save
-states with rewind and run-ahead, cheats and achievements. See
-[libretro core](#libretro-core-retroarch-raspberry-pi-5) for the build and the
-core options.
 
 DSperate is a **clean-room** reimplementation of DraStic's *techniques*,
 documented by studying its freely-distributable debug-symbol build (approved
@@ -247,8 +254,10 @@ recompiler; direct or firmware boot; DS or DSi console (DSiWare runs with the
 DSi BIOS pair in the system directory, no NAND); firmware language; the
 built-in analog (CPAD) patches on the sticks; a stick-driven stylus (R3
 taps); the host microphone or noise on a trigger; the Rumble Pak on the
-controller's motor. RetroArch's own cheats (Action Replay words) and
-achievements (main RAM is exposed) work. Build it on the device, or
+controller's motor. RetroArch's own cheats (Action Replay words) work, and so do
+RetroAchievements through RetroArch's own client, Hardcore included: the core
+publishes rcheevos' DS/DSi memory map (main RAM at `0x02000000`, data TCM at
+`0x0E000000`), so RetroArch handles sign-in, hashing and unlocks itself. Build it on the device, or
 cross-compile with the `aarch64-cross` toolchain file; the JIT and NEON
 kernels are in. On a 16 KB page kernel (the Pi 5 images) fastmem is declined
 and the recompiler keeps its page-table path; that costs about a quarter of a
