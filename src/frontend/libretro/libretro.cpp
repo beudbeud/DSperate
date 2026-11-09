@@ -496,6 +496,14 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
   if (const size_t m = nds->state_size_max(why)) state_max = state_bytes(m);
   else { state_max = 0; log(RETRO_LOG_WARN, "state: no size yet (%s)", why.c_str()); }
   collect_carry();
+  // RetroAchievements: rcheevos' DS/DSi map is main RAM at 0x02000000 plus data TCM at its pseudo address 0x0E000000.
+  static retro_memory_descriptor descs[2];
+  descs[0] = {RETRO_MEMDESC_SYSTEM_RAM, nds->bus.main_ram.get(), 0, 0x02000000, 0, 0, nds->bus.main_ram_size(), "MAINRAM"};
+  descs[1] = {RETRO_MEMDESC_SYSTEM_RAM, nds->bus.dtcm.get(), 0, 0x0E000000, 0, 0, mem::Bus::DTCM_SIZE, "DTCM"};
+  retro_memory_map mmap = {descs, 2};
+  env_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmap);
+  bool achievements = true;
+  env_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &achievements);
   return true;
 }
 
