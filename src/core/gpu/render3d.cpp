@@ -3427,7 +3427,9 @@ void Renderer3D::sync_line(const FrameRef& f, s32 y) {
       const double t0 = g_gpu_trace.on ? now_ms() : 0;
       // The frame before this one serves under the lag rule while the job
       // thread is still recording this one, with no wait on it.
-      const bool lag = f.allow_lag && f.gpu_gen > gpu_lag_floor_ + 1;   // the frame before is this session's
+      // ponytail: the frame before is this session's when the raster's count follows gpu_gen_; a submit the job
+      // thread refuses puts it one behind, so one right after a load could still lend the replaced session's frame.
+      const bool lag = f.allow_lag && f.gpu_gen > gpu_lag_floor_ + 1;
       f.out = lean_ ? lean_->frame_ready(f.gpu_gen > gpu_gen_base_ ? f.gpu_gen - gpu_gen_base_ : 1, lag) : nullptr;
       if (!f.out) { gpu_job_wait(); f.out = lean_ ? lean_->frame_ready(f.gpu_gen > gpu_gen_base_ ? f.gpu_gen - gpu_gen_base_ : 1, lag) : nullptr; }
       if (!f.out) f.out = out_[display_].data();   // a Lean with no frame yet: a stale picture, not a null read
