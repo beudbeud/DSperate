@@ -80,7 +80,12 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
   hardware. Compiled Vulkan pipelines are cached on disk, so later starts and
   AA switches are quick. The software rasteriser stays the exact reference and
   the fallback: what the GPU draws may differ from it within reason, never in
-  what is on screen.
+  what is on screen. With the Vulkan raster and the Vulkan present,
+  `video.gpu3d_scale` (`--gpu3d-scale`, the GPU 3D SCALE menu row) draws the 3D
+  at up to two or four times the DS's resolution (no finer than the largest
+  view shows): the 2D layers stay at the DS's and
+  the present merges them with the finer 3D image, also where the game shows
+  a captured 3D frame again; the game itself reads a 1x copy.
 - **Sound.** All sixteen SPU channels (PCM8/16, ADPCM, PSG, noise) and capture
   units, mixed at the console's real 32728.5 Hz. The frontend paces from its own
   frame limiter at the console's rate, not from the audio queue, and keeps the
@@ -179,11 +184,7 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
   hardware's own edge blend on the software rasteriser (pixel-exact with
   melonDS), and 4x MSAA on the Vulkan GPU raster, which also smooths the
   creases and cut-out edges the DS leaves stepped (the OpenGL ES raster has
-  none). `enhanced` (`--aa-enhanced`) on the GPU raster with the Vulkan
-  present cuts polygon edges at panel density instead: the raster places each
-  edge line from the polygons' sub-pixel geometry and the present blends
-  across it, a band one DS pixel wide, texture cut-outs included. It is
-  sharper than 4x but costs more CPU per frame.
+  none).
 - **Colour correction** (`video.colour`, `--colour`, the COLOUR menu row):
   `nds` gives the picture the original DS's colours (hunterk and Pokefan531's
   nds-color, as ROCKNIX's `lcd1x-nds-color` shader has it), `nds_lite` the
@@ -200,16 +201,12 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
   flips under KMSDRM, and SDL's renderer only where nothing else applies.
 - **Scaling off the CPU** (`video.gpu_present`, on by default where it works):
   the DS-resolution frames are scaled and laid out into the scanout buffer by
-  a Vulkan render pass, or by the Rockchip RGA (the RK3566's 2D accelerator,
-  through V4L2) where Vulkan does not work. Both draw the LCD grid and a
-  fading PiP inset. On the RGA, with bilinear off, whole-number scales are
-  exact nearest neighbour and fractional ones stay bilinear
-  (`video.integer_scale` makes any panel whole), and the menu greys out what
-  it cannot draw (seams, chunky cells). Where neither works, the scanline
+  a Vulkan render pass, which also draws the LCD grid and a fading PiP inset.
+  Where that does not work, the scanline
   scaler does the job on the CPU.
 - **Dual-window mode** for dual-panel handhelds: one fullscreen window per
   display, one DS screen each.
-- **On-screen overlays:** FPS counter, state slot number, screenshot flash,
+- **On-screen overlays:** FPS counter, state slot number, screenshot notice,
   achievement toasts.
 
 ## Building

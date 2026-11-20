@@ -14,7 +14,7 @@ namespace ds::gpu {
 // Vulkan first (the reference backend, and on the RG DS Plus the one that
 // shares the device with the present), then OpenGL ES. DS_GPU3D_API=vk|gles
 // tries one alone.
-std::unique_ptr<Raster3D> Raster3D::create(bool aa, bool edges, u32 scale, std::string* why) {
+std::unique_ptr<Raster3D> Raster3D::create(bool aa, u32 scale, std::string* why, bool fine) {
   const char* e = std::getenv("DS_GPU3D_API");
   const bool forced = e && *e;
   const bool want_vk = !forced || !std::strcmp(e, "vk") || !std::strcmp(e, "vulkan");
@@ -23,16 +23,28 @@ std::unique_ptr<Raster3D> Raster3D::create(bool aa, bool edges, u32 scale, std::
   if (want_vk) {
     std::shared_ptr<vk::Device> dev = vk::Device::shared(&wv);
     if (dev) {
-      std::unique_ptr<vk::Lean> l = vk::Lean::create(dev, aa, edges, scale, &wv);
+      std::unique_ptr<vk::Lean> l = vk::Lean::create(dev, aa, &wv, scale < 1 ? 1 : scale, fine);
       if (l && l->ready()) return l;
     }
   }
   if (want_gl) {
-    std::unique_ptr<gl::Lean> l = gl::Lean::create(aa, edges, scale, &wg);
+    std::unique_ptr<gl::Lean> l = gl::Lean::create(aa, &wg, fine && scale > 1 ? scale : 1);
     if (l && l->ready()) return l;
   }
   if (why) *why = "Vulkan: " + wv + "; OpenGL ES: " + wg;
   return nullptr;
+}
+
+bool Raster3D::warm(bool aa, u32 scale) {
+  const char* e = std::getenv("DS_GPU3D_API");
+  if (e && *e && std::strcmp(e, "vk") != 0 && std::strcmp(e, "vulkan") != 0) return false;
+  std::string why;
+  std::shared_ptr<vk::Device> dev = vk::Device::shared(&why);
+  if (!dev) return false;
+  std::unique_ptr<vk::Lean> l = vk::Lean::create(dev, aa, &why, scale < 1 ? 1 : scale);
+  if (!l || !l->ready()) return false;
+  l->wait_pipelines();   // the set built on a thread too
+  return true;
 }
 
 } // namespace ds::gpu

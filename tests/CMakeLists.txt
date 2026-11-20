@@ -167,28 +167,49 @@ add_executable(test_sd_card sd_card_test.cpp)
 target_link_libraries(test_sd_card PRIVATE dsperate_core)
 add_test(NAME sd_card COMMAND test_sd_card)
 
+# DSPERATE_HWCPIPE_DIR=<HWCPipe checkout>: Mali hardware counters in the
+# raster probes (hwc_probe.h, DS_PROBE_HWC=1). Off unless given.
+set(DSPERATE_HWCPIPE_DIR "" CACHE PATH "HWCPipe source tree for the probes' Mali counters (optional)")
+if(DSPERATE_HWCPIPE_DIR)
+  set(HWCPIPE_WERROR OFF CACHE BOOL "" FORCE)
+  add_subdirectory(${DSPERATE_HWCPIPE_DIR} hwcpipe EXCLUDE_FROM_ALL)
+endif()
+function(dsperate_probe_hwc target)
+  if(DSPERATE_HWCPIPE_DIR)
+    target_link_libraries(${target} PRIVATE hwcpipe)
+    target_compile_definitions(${target} PRIVATE DSPERATE_HWCPIPE=1)
+  endif()
+endfunction()
+
+# The same probe on the OpenGL ES raster (gl/gl_lean.h), for Vulkan-less devices (the RG35XX SP). Not a test.
+if(DSPERATE_GLES)
+  add_executable(gles_probe gles_probe.cpp)
+  target_link_libraries(gles_probe PRIVATE dsperate_core ${CMAKE_DL_LIBS})   # libEGL / libGLESv2 are dlopen'd
+  dsperate_probe_hwc(gles_probe)
+endif()
+
 # GPU raster probe (gpu-raster branch): times a recorded frame on the Vulkan raster. Not a test.
 if(DSPERATE_VULKAN AND DSPERATE_VULKAN_INCLUDE)   # the headers may be missing on a build host (CI), which switches the raster off
   add_executable(vk_probe vk_probe.cpp)
   target_link_libraries(vk_probe PRIVATE dsperate_core ${CMAKE_DL_LIBS})   # the Vulkan loader is dlopen'd; a static-libstdc++ toolchain needs dl named here
   target_include_directories(vk_probe PRIVATE ${DSPERATE_VULKAN_INCLUDE})
+  dsperate_probe_hwc(vk_probe)
 endif()
 
-# RGA probe (gpu-raster branch): times the Rockchip 2D scaler (V4L2 mem2mem) on a dma-buf frame. Device-only, not a test.
+# The GPU raster's whole record above 1x on each backend the machine has (skips the ones it has not).
+if(DSPERATE_GLES OR DSPERATE_VULKAN)
+  add_executable(test_raster_fine raster_fine_test.cpp)
+  target_link_libraries(test_raster_fine PRIVATE dsperate_core ${CMAKE_DL_LIBS})
+  add_test(NAME raster_fine COMMAND test_raster_fine)
+endif()
+
 include(CheckIncludeFileCXX)
 check_include_file_cxx(linux/dma-buf.h DSPERATE_HAVE_DMABUF_H)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_executable(rga_probe rga_probe.cpp ${PROJECT_SOURCE_DIR}/src/frontend/sdl/dmaheap.cpp)
-  target_include_directories(rga_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
   # Per-source costs of the scanout dma-bufs (every /dev/dma_heap/*, udmabuf, DRM dumb): allocation, CPU
   # writes, cache sync, KMS import. Device-only, not a test.
   add_executable(dmabuf_probe dmabuf_probe.cpp ${PROJECT_SOURCE_DIR}/src/frontend/sdl/dmaheap.cpp)
   target_include_directories(dmabuf_probe PRIVATE ${PROJECT_SOURCE_DIR}/src)
-  # Integer nearest scaling from 1:1 RGA jobs (stride and rotation tricks); --sim checks the geometry anywhere.
-  # Wants the dma-buf UAPI header, which the A30's sysroot (glibc 2.23) lacks: skipped there (the present probes too).
-  if(DSPERATE_HAVE_DMABUF_H)
-    add_executable(rga_nearest_probe rga_nearest_probe.cpp)
-  endif()
 endif()
 
 # GPU present probe: the fragment present against a nearest blit into imported dma-bufs. Device-only, not a test.

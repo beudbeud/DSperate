@@ -13,6 +13,7 @@
 #include "display_wl.h"
 
 #include <SDL2/SDL.h>
+#include <algorithm>
 
 #include <memory>
 #include <string>
@@ -47,15 +48,15 @@ public:
   bool open(const char* title, int scale, bool fullscreen, bool linear, bool vsync, const Layout& layout, int only_screen = -1, int display_index = 0);
   void close();
 
-  // `edges`: the edge cut's planes for fb (core/gpu/edge_cut.h), or null.
-  // Only a Vulkan present cuts; the others ignore them.
-  void draw(const u32* const fb[SCREENS], const EdgePlanes* edges = nullptr);
+  // `merge`: the 3D merge for fb (video/presenter.h), or null; only for a
+  // window merge3d_ok() said yes to before the frame was drawn.
+  void draw(const u32* const fb[SCREENS], const Merge3D* merge = nullptr);
   // The frame loop's present: each GPU-presenting window of `ds` takes the
   // frame on the present thread (present_thread.h) and this returns once the
   // frame is copied out, so `fb` may change straight after. The others draw
   // here, as draw() does. Every other call on a window waits for its present
   // first, so none of them sees one half done.
-  static void draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const EdgePlanes* edges = nullptr);
+  static void draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const Merge3D* merge = nullptr);
 
   // Per-scanline scaling: the core scales each line into place as it's
   // produced, straight into the window surface or a scanout tier's buffer
@@ -109,7 +110,7 @@ public:
   void set_page(bool on);
   // On the display-engine tier, chunky is applied by the scanline scaler at
   // 1:1 then rotated; grid/seams/bilinear need panel pixels and are off there.
-  // The GPU presenters (Vulkan, RGA) take chunky the same way: the core draws
+  // The GPU presenter takes chunky the same way: the core draws
   // the cells at 1:1 into src_side_ (source_targets), presented in place of
   // the core's frame (source_frame); their grid, seams and bilinear are their own.
   bool effects_at_source() const { return (disp_ != nullptr && scaled_) || src_gpu_; }
@@ -132,13 +133,30 @@ public:
   // GPU present stage (gpu_present.h): on a dma-buf scanout tier, a compute
   // dispatch lays 256x192 frames into the tier's buffer via Vulkan, replacing
   // the scanline scaler where the import works. Set before open().
-  // video.gpu_present: Auto tries the RGA (the Rockchip 2D accelerator, which
-  // leaves the GPU to the 3D layer) and then Vulkan; Rga and Vulkan are that one only.
-  enum class GpuPresentMode : u8 { Auto, Rga, Vulkan };
-  void set_gpu_present(bool on, GpuPresentMode mode = GpuPresentMode::Auto) { gpu_wanted_ = on; gpu_mode_ = mode; }
+  void set_gpu_present(bool on) { gpu_wanted_ = on; }
   bool gpu_present() const { return gpu_ != nullptr; }
-  bool rga_present() const { return gpu_ && gpu_->kind() == FramePresenter::Kind::Rga; }   // no seams or chunky
+  // A present the present thread can take: a GPU presenter, or the renderer
+  // with its GL context handed to that thread (open_renderer).
+  bool async_present() const { return gpu_ != nullptr || ren_threaded_; }
   bool vk_present() const { return gpu_ && gpu_->kind() == FramePresenter::Kind::Vulkan; }
+  // The Vulkan present can put the 3D layer into any screen this window
+  // shows (Merge3D): its views sample nearest and nothing corrects colours
+  // or draws cells before the merge.
+  bool merge3d_ok() const;
+  // What keeps the window from merging it, for the menu's GPU 3D SCALE row.
+  enum class MergeBlock : u8 { None, NoVulkanPresent, Bilinear, Colour, ChunkySource, SeamBlend };
+  MergeBlock merge3d_block() const;
+  // Where `screen` shows in this window, in the canvas's coordinates; false if it does not.
+  bool screen_rect(int screen, frontend::Rect& out) const {
+    for (int i = 0; i < nviews_; ++i) if (views_[i].shown && views_[i].screen == screen) { out = views_[i].rect; return true; }
+    return false;
+  }
+  // The largest whole scale a shown view reaches, rounded up (a 640x480 view: 3): no finer 3D image shows more on this window.
+  int max_view_scale() const {
+    int m = 1;
+    for (int i = 0; i < nviews_; ++i) if (views_[i].shown) m = std::max({m, (views_[i].rect.w + static_cast<int>(SCREEN_W) - 1) / static_cast<int>(SCREEN_W), (views_[i].rect.h + static_cast<int>(SCREEN_H) - 1) / static_cast<int>(SCREEN_H)});
+    return m;
+  }
   // Colour correction for the Vulkan present to apply as it uploads the
   // frames (Gpu::colour_lut), or null; ignored by every other route, where
   // the core corrects.
@@ -228,6 +246,9 @@ private:
   void build_scale();          // pick up the window surface and rebuild the x-map
   bool out_size(int& w, int& h) const;   // renderer output, or the surface in scaled mode (logical under rotation)
   bool rotated() const { return rot_ == 90 || rot_ == 270; }   // logical and presented sizes differ
+  // The window's size as it is presented. SDL's own, but under an SDL that reports the panel turned (turned_)
+  // the window is the logical side and the scanout buffer the panel's.
+  void presented_size(int& w, int& h) const;
   // Points the frame at the logical staging buffer under rotation, clearing
   // what the last frame left; the presented buffer is kept for present().
   void take_frame(u32* px, u32 stride, int w, int h, int idx, Target out[SCREENS]);
@@ -238,6 +259,9 @@ private:
 
   SDL_Window*   win_ = nullptr;
   SDL_Renderer* ren_ = nullptr;
+  bool ren_threaded_ = false;           // every renderer call runs on the present thread
+  bool ren_fallback_ = false;           // the renderer stands in for a scanout sink that would not open
+  void draw_renderer(const u32* const fb[SCREENS]);
   SDL_Texture*  tex_[SCREENS] = {nullptr, nullptr};
   View          views_[SCREENS] = {};
   int           nviews_ = SCREENS;
@@ -256,6 +280,7 @@ private:
   bool              scaled_ = false;
   int               rot_wanted_ = 0;      // set_rotation(); DS_ROTATE otherwise
   int               rot_ = 0;             // in effect on the scanline tiers
+  bool              turned_ = false;      // KMS under an SDL that reports the panel turned: rot_ is the panel's turn, pointer events come logical
   int               phys_w_ = 0, phys_h_ = 0;   // the presented buffer's size (scaled_w_/h_ are logical)
   std::vector<u32>  stage_;               // the logical frame under rotation
   u32*              phys_px_ = nullptr;   // the presented buffer this frame, under rotation
@@ -272,14 +297,13 @@ private:
   bool              page_ = false;
   std::unique_ptr<ScanoutOut> out_;     // tier 1; null on the surface tier
   bool              gpu_wanted_ = false;
-  GpuPresentMode    gpu_mode_ = GpuPresentMode::Auto;
   std::unique_ptr<FramePresenter> gpu_; // a GPU presenter (on top of out_ for the import one); null: software
   bool try_gpu_present();               // after out_ opened: import its buffers, switch draw() over
   // One frame for gpu_, taken on this thread (the window's size, the views,
   // the overlay's rect) so it can be presented on another.
   struct GpuFrame { FramePresenter* p = nullptr; FramePresenter::View v[SCREENS]; int n = 0; FramePresenter::Params params; };
   bool prepare_gpu(GpuFrame& f);        // false: nothing to present (the presenter was lost)
-  void draw_gpu(const u32* const fb[SCREENS], const EdgePlanes* edges);
+  void draw_gpu(const u32* const fb[SCREENS], const Merge3D* merge);
   mutable u64       job_ = 0;             // present thread ticket of this window's last frame; 0 once waited for
   void sync() const;                    // wait for it
   SDL_Surface*      surf_ = nullptr;    // window surface; owned by SDL

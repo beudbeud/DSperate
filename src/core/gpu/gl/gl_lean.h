@@ -11,15 +11,15 @@
 // The lean GPU 3D raster on OpenGL ES 3.1 (gpu_raster.h has the interface;
 // vk/vk_lean.h the Vulkan original this follows draw for draw): for devices
 // whose driver has no Vulkan, the RG35XX SP's Mali-G31 blob first. The
-// same shading (the Vulkan raster's ds_shade.glsl and ds_spans.glsl,
-// included as they are), the same stencil rules, the same passes; GL's
+// same shading (the Vulkan raster's ds_shade.glsl,
+// included as it is), the same stencil rules, the same passes; GL's
 // differences are kept to the edges of the frame:
 // - no storage buffers in the vertex stage on Mali, so polygons and
 //   vertices reach it as RGBA32UI textures (gl_pull.glsl); the fragment
-//   stage reads them, the span table, the post tables and the texel arena
+//   stage reads them, the post tables and the texel arena
 //   as storage buffers, all persistently mapped (EXT_buffer_storage,
 //   required) so the CPU writes them as the Vulkan path does;
-// - no subpasses: the edge passes and the resolve read the draw's
+// - no subpasses: the resolve and the marking pass read the draw's
 //   attachments as textures after it (0.3 MB of tile writeback);
 // - DS row y draws on GL row y, so gl_FragCoord is the DS coordinate and
 //   the record reads back top row first with no flip;
@@ -27,7 +27,7 @@
 //   nearest w, so the far end keeps its precision through GL's fixed depth
 //   mapping (the Vulkan path stores 1/w as is); DS_GL_WCLIP=0 writes
 //   gl_FragDepth from the perspective-correct w instead, exact but late;
-// - the record and the edge bytes leave through RGBA8 attachments and
+// - the record leaves through an RGBA8 attachment and
 //   glReadPixels into persistently mapped PBOs, their bytes the record's
 //   own layout;
 // - frames are fenced with EGL_KHR_fence_sync, which needs no current
@@ -41,9 +41,10 @@ namespace ds::gpu::gl {
 
 class Lean final : public Raster3D {
 public:
-  // `edges`: the edge cut (the GL raster's AA; `aa` without it draws plain: no MSAA here).
-  // `scale` (1-4, not with `edges`): the draw at 256x192 times it, the 1x record its nearest blit (hires_for).
-  static std::unique_ptr<Lean> create(bool aa, bool edges, u32 scale = 1, std::string* why = nullptr);
+  // `aa` draws plain: no MSAA here. `scale` above 1: the draw at 256x192
+  // times it, the record read here its 1x pick and fine_for the whole; 0,
+  // the probes: DS_LEAN_SCALE, and the record read back at that size.
+  static std::unique_ptr<Lean> create(bool aa, std::string* why = nullptr, u32 scale = 0);
   ~Lean() override;
   Lean(const Lean&) = delete;
   Lean& operator=(const Lean&) = delete;
@@ -51,22 +52,20 @@ public:
   bool ready() const override { return ready_; }
   const char* api() const override { return "OpenGL ES"; }
   bool msaa() const override { return false; }
-  bool edges() const override;
   vk::GpuPoly* poly_buffer() override;
   vk::GpuVert* vert_buffer() override;
   u32*         texel_buffer(u32* capacity) override;
   vk::GpuPost* post_buffer() override;
-  u32*         span_buffer() override;
   bool submit(u32 npoly, u32 nvert, u32 ntexels, const vk::GpuFrame& f) override;
   void wait() override;
   void wait_all() override;
   const u32* output() override;
   const u32* frame_ready(u64 gen, bool allow_lag) override;
-  const u8* edges_for(const u32* out) const override;
-  const u32* hires_for(const u32* out, u32* scale) const override;
   bool has_frame() const override;
-  void forget() override;
   u64 gpu_ns() const override;
+  u32 scale() const override;   // the attachment scale (see create)
+  const u32* fine_for(const u32* out) const override;
+  u64 fence_ns() const;   // flush to fence of the last collected frame: its GPU time when nothing else was queued (gles_probe)
   u32 draws() const override;
   Stats stats(bool reset) override;
 

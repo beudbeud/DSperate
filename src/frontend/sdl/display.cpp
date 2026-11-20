@@ -111,6 +111,11 @@ void Display::rotate_out(u32* dst, u32 dst_pitch) const {
   }
 }
 
+void Display::presented_size(int& w, int& h) const {
+  SDL_GetWindowSize(win_, &w, &h);
+  if (turned_) std::swap(w, h);
+}
+
 void Display::output_size(int& w, int& h) const {
   out_size(w, h);
   if (rotated()) std::swap(w, h);
@@ -151,6 +156,7 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
   if (!win_) { std::fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError()); return false; }
   fullscreen_ = fullscreen;
   rot_ = 0;
+  turned_ = false;
 
   if (panel && panel_ == Sink::Disp && open_disp(linear, vsync, rot)) { sink_ = Sink::Disp; return true; }
   if (panel && panel_ == Sink::Fbdev) {
@@ -160,9 +166,15 @@ bool Display::open(const char* title, int scale, bool fullscreen, bool linear, b
 
   const char* vd = SDL_GetCurrentVideoDriver();
   auto env = [](const char* k) { const char* e = std::getenv(k); return std::string(e ? e : ""); };
-  const frontend::WindowPlan plan = frontend::plan_window({want_, vd ? vd : "", env("DS_DMABUF"), env("DS_SCANLINE_SCALE")});
+  u32 panel_px = 0;
+  { SDL_DisplayMode dm{}; if (SDL_GetDesktopDisplayMode(display_index, &dm) == 0 && dm.w > 0 && dm.h > 0) panel_px = static_cast<u32>(dm.w) * static_cast<u32>(dm.h); }
+  const frontend::WindowPlan plan = frontend::plan_window({want_, vd ? vd : "", env("DS_DMABUF"), env("DS_SCANLINE_SCALE"), rot != 0, panel_px});
+  ren_fallback_ = false;
   for (const Sink s : plan.order) {
     bool ok = false;
+    // The renderer as the fallback: nothing asked for it, and this driver
+    // has scanout sinks that would not open (or DS_DMABUF=0 forbade them).
+    if (s == Sink::Renderer) ren_fallback_ = want_ == Sink::Count && vd && (!std::strcmp(vd, "wayland") || !std::strcmp(vd, "KMSDRM"));
     switch (s) {
       case Sink::Kms:      ok = open_kms(rot); break;
       case Sink::Dmabuf:   ok = open_dmabuf(rot); break;
@@ -225,7 +237,17 @@ bool Display::open_kms(int rot) {
   SDL_GetWindowSize(win_, &ow, &oh);
   auto dr = std::make_unique<DrmOut>();
   if (gpu_wanted_) dr->set_bufs(DrmOut::DEFAULT_BUFS + 1);
-  if (!dr->open(win_, ow, oh, display_index_)) { scaled_ = false; rot_ = 0; return false; }
+  bool turned = false;
+  if (!dr->open(win_, ow, oh, display_index_, &turned)) { scaled_ = false; rot_ = 0; return false; }
+  if (turned) {
+    // SDL reports the panel turned and would turn its own GLES frames before scanout (the RGA rotate patches of
+    // ArkOS and dArkMoss on portrait panels mounted landscape). This sink scans out past SDL, so the turn is ours:
+    // the rotation asked for if it is a quarter turn, else SDL's usual one, 270 (DS_ROTATE=90 for a panel
+    // mounted the other way). A half turn asked for on top of it makes 90.
+    turned_ = true;
+    rot_ = (rot == 90 || rot == 270) ? rot : rot == 180 ? 90 : 270;
+    std::fprintf(stderr, "drm: SDL reports the %dx%d panel as %dx%d; scanning out at the panel's size, picture turned %d here\n", oh, ow, ow, oh, rot_);
+  }
   out_ = std::move(dr);
   layout();
   build_scale();
@@ -317,6 +339,22 @@ bool Display::open_renderer(bool linear, bool vsync, int rot) {
     const unsigned char* ver  = gl_get_string(0x1F02);      // GL_VERSION
     if (rend) std::fprintf(stderr, "gl: %s | %s\n", rend, ver ? reinterpret_cast<const char*>(ver) : "?");
   }
+  // The renderer's GL context moves to the present thread, so the swap's
+  // block is off the emulation thread: on the RG DS Plus under Wayland that
+  // took work time below the dma-buf sink's (GS:DD 16.0 -> 14.1 ms median).
+  // SDL's GL renderers make their context current on whichever thread calls
+  // them; this thread lets go here. On where the renderer is the fallback
+  // for a sink that would not open; where it is the plan's first choice (an
+  // X11 desktop) or was asked for, only with DS_REN_THREAD=1, since a window
+  // resize there reaches SDL's renderer from this thread. On the mali-fbdev
+  // driver it gains nothing (the swap runs to the refresh on any thread).
+  // DS_REN_THREAD=0 keeps every call here.
+  const char* rt = std::getenv("DS_REN_THREAD");
+  ren_threaded_ = (rt ? *rt != '0' : ren_fallback_) && SDL_GL_GetCurrentContext() != nullptr;
+  if (ren_threaded_) {
+    SDL_GL_MakeCurrent(win_, nullptr);
+    std::fprintf(stderr, "video: renderer presents on the present thread\n");
+  }
   return true;
 }
 
@@ -328,6 +366,12 @@ void Display::close() {
   frame_px_ = nullptr;
   surf_ = nullptr;   // owned by SDL, freed with the window
   for (auto*& t : tex_) { if (t) SDL_DestroyTexture(t); t = nullptr; }
+  if (ren_ && ren_threaded_) {
+    PresentThread& pt = PresentThread::get();
+    SDL_Window* w = win_;
+    pt.wait(pt.post([w] { SDL_GL_MakeCurrent(w, nullptr); }));
+    ren_threaded_ = false;
+  }
   if (ren_) { SDL_DestroyRenderer(ren_); ren_ = nullptr; }
   if (win_) { SDL_DestroyWindow(win_); win_ = nullptr; }
 }
@@ -375,14 +419,7 @@ void Display::layout_views() {
 bool Display::try_gpu_present() {
   if (!gpu_wanted_ || !out_) return false;
   std::string why;
-  // Auto: Vulkan first (a render pass into the scanout buffer beats the
-  // RGA's ~1.1 GB/s, even beside the GPU 3D layer), the RGA where it fails.
-  if (gpu_mode_ != GpuPresentMode::Rga) gpu_ = open_vk_import_presenter(*out_, &why);
-  if (!gpu_ && gpu_mode_ != GpuPresentMode::Vulkan) {
-    std::string why2;
-    gpu_ = open_rga_presenter(*out_, &why2);
-    if (!gpu_) why = gpu_mode_ == GpuPresentMode::Rga ? why2 : why + "; " + why2;
-  }
+  gpu_ = open_vk_import_presenter(*out_, &why);
   if (!gpu_) { std::fprintf(stderr, "video.gpu_present: %s; scanline scaling instead\n", why.c_str()); return false; }
   scaled_ = false;
   layout();
@@ -434,7 +471,7 @@ void Display::sync() const {
 
 bool Display::prepare_gpu(GpuFrame& f) {
   int w = 0, h = 0;
-  SDL_GetWindowSize(win_, &w, &h);
+  presented_size(w, h);
   switch (gpu_->fit(win_, w, h)) {
     case FramePresenter::Fit::Lost:
       // The sink may be closed now; begin_frame() reopens it or falls back
@@ -450,7 +487,7 @@ bool Display::prepare_gpu(GpuFrame& f) {
   f.n = nviews_;
   p.rot = rot_; p.inset_alpha = inset_alpha_; p.linear = linear_;
   p.seam_blend = src_gpu_ ? 0 : seam_blend_;   // cells at source: their seams were the core's to draw
-  p.colour = gpu_->kind() == FramePresenter::Kind::Vulkan ? colour_ : nullptr;
+  p.colour = colour_;
   p.drawn = frontend::Rect{canvas_drawn_.x, canvas_drawn_.y, canvas_drawn_.w, canvas_drawn_.h};
   p.grid = grid_strength_ > 0.0 ? static_cast<u32>(std::lround((1.0 - grid_strength_) * 256.0)) : 256u;
   canvas_drawn_ = SDL_Rect{0, 0, 0, 0};
@@ -458,20 +495,34 @@ bool Display::prepare_gpu(GpuFrame& f) {
   return true;
 }
 
-void Display::draw_gpu(const u32* const fb[SCREENS], const EdgePlanes* edges) {
+bool Display::merge3d_ok() const { return merge3d_block() == MergeBlock::None; }
+
+Display::MergeBlock Display::merge3d_block() const {
+  if (!vk_present()) return MergeBlock::NoVulkanPresent;
+  if (linear_) return MergeBlock::Bilinear;
+  if (colour_) return MergeBlock::Colour;
+  if (src_gpu_) return MergeBlock::ChunkySource;
+  if (seam_blend_)   // seams blend except at a whole scale or on a view shorter than the screen (GpuPresent::present)
+    for (int i = 0; i < nviews_; ++i) {
+      const frontend::Rect& r = views_[i].rect;
+      if (views_[i].shown && !(r.h < 192 || (r.w % 256 == 0 && r.h % 192 == 0))) return MergeBlock::SeamBlend;
+    }
+  return MergeBlock::None;
+}
+
+void Display::draw_gpu(const u32* const fb[SCREENS], const Merge3D* merge) {
   GpuFrame f;
   if (!prepare_gpu(f)) return;
-  if (edges) f.params.edges = *edges;
+  if (merge) f.params.merge = *merge;
   f.p->present(fb, f.v, f.n, f.params);
 }
 
-void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const EdgePlanes* edges) {
+void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const Merge3D* merge) {
   // One copy of the frame for every window: the core writes the next frame
   // into fb while the present thread reads this one. Reused once the job
   // that read it is done.
   static std::vector<u32> stage[SCREENS];
-  static std::vector<u32> estage[SCREENS];   // the edge planes' marked lines (the others are never read)
-  static u64 erows[SCREENS][3];
+  static std::vector<u32> mstage[SCREENS], mexpect[SCREENS];   // per screen: the 3D merge's words, its coordinate words, its 192 line words; the check's frame
   static u64 stage_job = 0;
   // A frame reaches the sink at the next present, when its fence has long
   // signalled: on the Mali-G52 a present's compute takes ~5 ms from submit
@@ -480,32 +531,41 @@ void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS
   static const bool retire = std::getenv("DS_PRESENT_RETIRE") != nullptr;
   GpuFrame frames[2];
   Display* owners[2] = {};
-  int nf = 0;
+  Display* rens[2] = {};
+  int nf = 0, nr = 0;
   for (int i = 0; i < n && i < 2; ++i) {
     Display& d = *ds[i];
     d.sync();
-    if (!d.gpu_) { d.draw(fb, edges); continue; }
+    if (d.ren_threaded_) { rens[nr++] = &d; continue; }
+    if (!d.gpu_) { d.draw(fb, merge); continue; }
     if (d.prepare_gpu(frames[nf])) owners[nf++] = &d;
   }
-  if (!nf) return;
+  if (!nf && !nr) return;
   PresentThread& pt = PresentThread::get();
   pt.wait(stage_job);
   for (int s = 0; s < SCREENS; ++s) {
     stage[s].resize(static_cast<size_t>(SCREEN_W) * SCREEN_H);
     std::memcpy(stage[s].data(), fb[s], stage[s].size() * sizeof(u32));
   }
-  EdgePlanes staged;
-  if (edges)
-    for (int s = 0; s < SCREENS; ++s) {
-      if (!edges->plane[s] || !edges->rows[s]) continue;
-      estage[s].resize(static_cast<size_t>(SCREEN_W) * SCREEN_H);
-      copy_edge_rows(estage[s].data(), *edges, s, fb[s]);
-      for (int k = 0; k < 3; ++k) erows[s][k] = edges->rows[s][k];
-      staged.plane[s] = estage[s].data(); staged.rows[s] = erows[s];
+  Merge3D mstaged;
+  if (merge)
+    for (int k = 0; k < SCREENS; ++k) {
+      const Merge3D::Screen& m = merge->s[k];
+      if (!m.has()) continue;
+      const size_t n = static_cast<size_t>(SCREEN_W) * SCREEN_H;
+      std::vector<u32>& st = mstage[k];
+      st.resize(2 * n + SCREEN_H);
+      std::memcpy(st.data(), m.words, n * sizeof(u32));
+      if (m.coords) std::memcpy(st.data() + n, m.coords, n * sizeof(u32));
+      std::memcpy(st.data() + 2 * n, m.lines, SCREEN_H * sizeof(u32));
+      Merge3D::Screen& o = mstaged.s[k];
+      o = m; o.words = st.data(); o.coords = m.coords ? st.data() + n : nullptr; o.lines = st.data() + 2 * n;
+      if (m.expect) { mexpect[k].assign(m.expect, m.expect + n); o.expect = mexpect[k].data(); }
     }
-  for (int k = 0; k < nf; ++k) frames[k].params.edges = staged;
-  stage_job = pt.post([frames, nf] {
+  for (int k = 0; k < nf; ++k) frames[k].params.merge = mstaged;
+  stage_job = pt.post([frames, nf, rens, nr] {
     const u32* const sfb[SCREENS] = {stage[0].data(), stage[1].data()};
+    for (int k = 0; k < nr; ++k) rens[k]->draw_renderer(sfb);
     for (int k = 0; k < nf; ++k) {
       const GpuFrame& f = frames[k];
       f.p->present(sfb, f.v, f.n, f.params);
@@ -513,11 +573,12 @@ void Display::draw_async(Display* const ds[], int n, const u32* const fb[SCREENS
     }
   });
   for (int k = 0; k < nf; ++k) owners[k]->job_ = stage_job;
+  for (int k = 0; k < nr; ++k) rens[k]->job_ = stage_job;
 }
 
-void Display::draw(const u32* const fb[SCREENS], const EdgePlanes* edges) {
+void Display::draw(const u32* const fb[SCREENS], const Merge3D* merge) {
   sync();
-  if (gpu_) { draw_gpu(fb, edges); return; }
+  if (gpu_) { draw_gpu(fb, merge); return; }
   if (disp_) {
     if (disp_->overlay_available()) { disp_->overlay_changed(canvas_taken_); canvas_taken_ = false; }
     const u32* slots[DispOut::VIEWS] = {nullptr, nullptr};
@@ -527,6 +588,16 @@ void Display::draw(const u32* const fb[SCREENS], const EdgePlanes* edges) {
     return;
   }
   if (!ren_) return;   // renderer tier only; scanline tiers use begin_frame/end_frame
+  if (ren_threaded_) {
+    // Paused paths: same thread as the live frames, waited for.
+    PresentThread& pt = PresentThread::get();
+    pt.wait(pt.post([this, fb] { draw_renderer(fb); }));
+    return;
+  }
+  draw_renderer(fb);
+}
+
+void Display::draw_renderer(const u32* const fb[SCREENS]) {
   SDL_SetRenderDrawColor(ren_, 0, 0, 0, 255);
   SDL_RenderClear(ren_);
   for (int i = 0; i < nviews_; ++i) {
@@ -579,8 +650,9 @@ void Display::set_layout(const Layout& l) {
 }
 
 bool Display::map_point(int wx, int wy, int& screen, int& sx, int& sy) const {
-  // Pointer events arrive in presented pixels; inverse of rotate_out()'s mapping.
-  if (rot_ && scaled_) {
+  // Pointer events arrive in presented pixels; inverse of rotate_out()'s mapping. (Not under turned_: SDL has
+  // turned them already.)
+  if (rot_ && scaled_ && !turned_) {
     const int lw = scaled_w_, lh = scaled_h_;
     int lx = wx, ly = wy;
     switch (rot_) {
@@ -611,7 +683,7 @@ bool Display::out_size(int& w, int& h) const {
   if (!win_) return false;
   // Window size is the truth on a scanout tier: the shm surface can lag a
   // configure by a frame, and KMSDRM has no window surface to ask at all.
-  if (out_) { SDL_GetWindowSize(win_, &w, &h); if (rotated()) std::swap(w, h); return w > 0 && h > 0; }
+  if (out_) { presented_size(w, h); if (rotated()) std::swap(w, h); return w > 0 && h > 0; }
   SDL_Surface* s = SDL_GetWindowSurface(win_);
   if (!s) return false;
   w = s->w; h = s->h;
@@ -937,7 +1009,7 @@ bool Display::begin_frame(Target out[SCREENS]) {
     // A configure resizes the window under us; buffers must follow before
     // anything writes at the new geometry.
     int w = 0, h = 0;
-    SDL_GetWindowSize(win_, &w, &h);
+    presented_size(w, h);
     if (w != out_->width() || h != out_->height()) {
       if (!out_->reopen(win_, w, h)) {
         std::fprintf(stderr, "video: scanout resize failed; window surface from here\n");

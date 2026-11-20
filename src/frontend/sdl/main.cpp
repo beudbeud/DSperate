@@ -14,6 +14,7 @@
 #include "core/cart/zip.h"
 #include "core/cart/zip_cache.h"
 #include "core/gpu/colour.h"
+#include "core/gpu/gpu_raster.h"
 #include "core/gpu/vk/vk_device.h"
 #include "core/profile.h"
 #include "core/frame_report.h"
@@ -180,8 +181,7 @@ const char* kUsage =
     "                  surface (SDL's window surface) | renderer (SDL_Renderer). One that won't open\n"
     "                  falls back to the renderer. video.sink. --disp / --fbdev are --sink disp / fbdev\n"
     "  --gpu-present / --no-gpu-present  scale and lay out the picture off the CPU, into the\n"
-    "                  scanout buffer: a Vulkan render pass, else the Rockchip RGA where the\n"
-    "                  device has one (video.gpu_present = true | rga | vulkan | false; on by default)\n"
+    "                  scanout buffer, in a Vulkan render pass (video.gpu_present; on by default)\n"
     "  --preload-rom / --no-preload-rom  read the whole ROM into memory at load, or page it in as\n"
     "                  the game reads it (cart.preload = auto | true | false; auto preloads a ROM on a\n"
     "                  network share that fits in memory, where a page read mid-frame is a round trip)\n"
@@ -197,11 +197,10 @@ const char* kUsage =
     "                  | exact (melonDS's per-access model); emu.timing\n"
     "  --aa / --no-aa  3D anti-aliasing (video.aa, off by default): the DS's own edge blend on the\n"
     "                  CPU raster; 4x MSAA on the GPU raster under Vulkan, none under OpenGL ES\n"
-    "  --aa-enhanced   video.aa = enhanced: on the GPU raster with the Vulkan present, 3D edges\n"
-    "                  (texture cut-outs too) are cut at panel density from the polygons' own lines\n"
-    "                  instead: sharper, more CPU. Anywhere else the same as --aa\n"
     "  --gpu3d / --no-gpu3d  the 3D layer drawn on the GPU (video.gpu3d, off by default): Vulkan,\n"
     "                  else OpenGL ES 3.1; the CPU raster where neither works\n"
+    "  --gpu3d-scale N the GPU raster's 3D at N times the DS's resolution, 1, 2 or 4 (video.gpu3d_scale):\n"
+    "                  Vulkan raster with the Vulkan present only, and no finer than the view shows\n"
     "  --frameskip N   skip drawing up to N frames in N+1 (0 = off); emu.frameskip. Skipping runs\n"
     "                  in whole display periods, so on a game that drives its screens on\n"
     "                  alternate frames the limit counts pairs (DS_DEBUG_SKIP=1 shows the period)\n"
@@ -314,29 +313,31 @@ std::string save_path(const std::string& rom, const std::string& dir) {
   return dir.empty() ? rom_stem(rom) + ".sav" : dir + "/" + base_name(rom_stem(rom)) + ".sav";
 }
 
-// video.aa: false / true / enhanced. On the GPU raster true is 4x MSAA and
-// enhanced the edge cut, texture cut-out edges included (the cut-out pass);
-// the CPU raster shows the hardware's blend either way. The older mode
-// words still read: accurate / smooth as on, off as off.
+// video.aa: false / true. On the GPU raster true is 4x MSAA; the CPU raster
+// shows the hardware's blend. The older mode words still read: accurate /
+// enhanced / smooth as on, off as off.
 bool aa_on(const std::string& v) {
   return v == "true" || v == "1" || v == "yes" || v == "on" || v == "accurate" || v == "enhanced" || v == "smooth";
 }
-bool aa_enhanced(const std::string& v) { return v == "enhanced"; }
-void apply_aa(NDS& nds, const std::string& v) { nds.gpu3d.renderer().set_aa(aa_on(v)); nds.gpu3d.renderer().set_aa_enhanced(aa_enhanced(v)); }
+void apply_aa(NDS& nds, const std::string& v) { nds.gpu3d.renderer().set_aa(aa_on(v)); }
 void apply_colour(NDS& nds, const std::string& v) {
   ds::gpu::ColourProfile p;
   if (!ds::gpu::parse_colour_profile(v, p)) std::fprintf(stderr, "video.colour: unknown profile '%s' (off | nds | nds_lite), off\n", v.c_str());
   nds.gpu.set_colour_profile(p);
 }
-// Whether the edge cut runs (the frame loop has why): video.aa = enhanced on
-// the GPU raster (`gpu_on`: it is, or is about to be, the GPU's) through the
-// Vulkan present on every window. DS_EDGE_CUT=0 never, =1 with plain
-// video.aa and on the CPU raster too.
-bool edge_cut_wanted(NDS& nds, const ds::sdl::Display& d1, const ds::sdl::Display& d2, bool dual, bool gpu_on) {
-  static const int cut_env = [] { const char* e = std::getenv("DS_EDGE_CUT"); return e && *e ? *e - '0' : -1; }();
-  auto vk_present = [](const ds::sdl::Display& d) { return d.gpu_present() && !d.rga_present(); };
-  return cut_env != 0 && vk_present(d1) && (!dual || vk_present(d2)) &&
-         nds.gpu3d.renderer().aa() && ((gpu_on && nds.gpu3d.renderer().aa_enhanced()) || cut_env == 1);
+
+// video.gpu3d_scale as the raster should run now: the setting, but 1 where
+// the windows cannot merge the raster's image (anything but the Vulkan
+// present, a bilinear or fractional seam filter, colour correction: the CPU
+// composite then shows the 1x record and a finer image would be drawn for
+// nothing), and no finer than the largest view shows.
+ds::u32 gpu3d_scale_now(int setting, const ds::sdl::Display& d1, const ds::sdl::Display& d2, bool dual) {
+  const char* const e = std::getenv("DS_GPU3D_SCALE");   // overrides the setting, and is not held to the views' size (measurements; the merge's downsample)
+  if (e) setting = std::atoi(e);
+  if (setting <= 1 || !d1.merge3d_ok() || (dual && !d2.merge3d_ok())) return 1;
+  const int view = e ? 4 : std::max(d1.max_view_scale(), dual ? d2.max_view_scale() : 1);
+  const int n = std::min(setting, view);   // 1x, 2x or 4x: a view of three takes 2x
+  return n >= 4 ? 4u : n >= 2 ? 2u : 1u;
 }
 
 void load_save(NDS& nds, const std::string& path) {
@@ -428,6 +429,7 @@ void write_gba_save(NDS& nds, const std::string& path) {
 bool write_png(NDS& nds, const std::string& path, const ds::sdl::Display::Layout& shown, const u32* const* frames = nullptr) {
   using Disp = ds::sdl::Display;
   int w = 0, h = 0;
+  nds.gpu.resolve_split3d();   // a frame split for the present's 3D merge: the file gets the whole picture
   Disp::Layout layout = shown;
   layout.gap = 0; layout.gap_auto = false;   // screen_gap is a panel distance, not part of the game's picture
   Disp::natural_size(layout, 1.0, w, h);
@@ -475,14 +477,16 @@ bool write_png(NDS& nds, const std::string& path, const ds::sdl::Display::Layout
 }
 
 // <GAMECODE>-<timestamp>.png in paths.screenshots (states dir unless set).
-void screenshot(NDS& nds, const std::string& dir, const ds::sdl::Display::Layout& layout, const u32* const* frames = nullptr) {
+bool screenshot(NDS& nds, const std::string& dir, const ds::sdl::Display::Layout& layout, const u32* const* frames = nullptr) {
   ::mkdir(dir.c_str(), 0755);
   char stamp[32];
   const std::time_t now = std::time(nullptr);
   std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&now));
   std::string code(nds.cart ? nds.cart->header().game_code : "NONE", 4);
   const std::string path = dir + "/" + code + "-" + stamp + ".png";
-  if (write_png(nds, path, layout, frames)) std::fprintf(stderr, "screenshot: %s\n", path.c_str());
+  const bool ok = write_png(nds, path, layout, frames);
+  if (ok) std::fprintf(stderr, "screenshot: %s\n", path.c_str());
+  return ok;
 }
 
 std::string state_path(NDS& nds, const std::string& dir, int slot) {
@@ -920,16 +924,6 @@ ds::sdl::Rect draw_label(const ds::sdl::Canvas& d, const char* text, bool right)
 // Slot digit or status ("STATE 3 SAVED") shown after a state hotkey.
 constexpr int SLOT_OSD_FRAMES = 90;
 
-// White blended over the whole screen at `alpha`, fading over FLASH_FRAMES.
-// Drawn into the presented buffer, not the GPU framebuffers, so it's excluded from screenshots.
-constexpr int FLASH_FRAMES = 12;
-void draw_flash(const ds::sdl::Canvas& d, u32 alpha) {
-  if (d.w <= 0 || d.h <= 0) return;
-  std::vector<u32> white(static_cast<size_t>(d.w), 0xFFFFFFFFu);
-  for (int y = 0; y < d.h; ++y)
-    ds::sdl::Display::blend_row(d.px + static_cast<size_t>(y) * d.pitch, white.data(), static_cast<size_t>(d.w), alpha);
-}
-
 // A launcher's SIGTERM (or Ctrl-C) ends the frame loop as the menu's quit
 // does: the auto state and the battery save are written, then it exits 0.
 std::atomic<int> g_signalled{0};
@@ -971,7 +965,6 @@ struct VideoSetup {
   ds::sdl::Display::Layout layout;
   std::vector<ds::sdl::Display::Mode> layout_cycle;
   bool   gpu_present = false;
-  ds::sdl::Display::GpuPresentMode gpu_mode = ds::sdl::Display::GpuPresentMode::Auto;   // video.gpu_present: true (auto: Vulkan, else RGA) | rga | vulkan
   // Boot-only, see above.
   ds::frontend::Sink panel_sink = ds::frontend::Sink::Count;   // Disp/Fbdev when one owns the panel (frontend/video/select.h)
   ds::frontend::Sink want_sink = ds::frontend::Sink::Count;    // explicit video.sink among the window sinks
@@ -1014,7 +1007,7 @@ bool parse_video(const ds::sdl::Config& cfg, VideoSetup& vs) {
   // Read here, not at boot only, so reopening for a menu change keeps it.
   {
     const std::string g = cfg.str("video.gpu_present", "true");
-    vs.gpu_mode = g == "rga" ? Disp::GpuPresentMode::Rga : g == "vulkan" ? Disp::GpuPresentMode::Vulkan : Disp::GpuPresentMode::Auto;
+    // "vulkan" and "rga" are values older configs carry (the RGA present is gone): on.
     vs.gpu_present = g == "rga" || g == "vulkan" || g == "true" || g == "auto" || g == "on" || g == "1";
   }
   vs.vsync = cfg.flag("video.vsync", true);
@@ -1083,7 +1076,7 @@ bool sync_dual_modes(ds::sdl::Display& a, ds::sdl::Display& b) {
 // Split from parse_video so a settings change can close the windows and
 // come back through here with new values.
 bool open_displays(const VideoSetup& vs, ds::sdl::Display& display, ds::sdl::Display& display2) {
-  display.set_gpu_present(vs.gpu_present, vs.gpu_mode); display2.set_gpu_present(vs.gpu_present, vs.gpu_mode);
+  display.set_gpu_present(vs.gpu_present); display2.set_gpu_present(vs.gpu_present);
   if (vs.dual_window) {
     display.set_sinks(ds::frontend::Sink::Count, vs.want_sink); display2.set_sinks(ds::frontend::Sink::Count, vs.want_sink);
     display.set_chunky(vs.chunky != 0, vs.chunky_cell); display2.set_chunky(vs.chunky != 0, vs.chunky_cell);
@@ -1320,12 +1313,13 @@ static int run(int argc, char** argv) {
     else if (flag("--frameskip-capture")) cli.set("emu.frameskip_capture", "true");
     else if (flag("--no-frameskip-capture")) cli.set("emu.frameskip_capture", "false");
     else if (flag("--aa")) cli.set("video.aa", "true");
-    else if (flag("--aa-enhanced")) cli.set("video.aa", "enhanced");
+    else if (flag("--aa-enhanced")) cli.set("video.aa", "true");   // the old enhanced mode: now plain --aa
     else if (flag("--no-aa")) cli.set("video.aa", "false");
     else if (flag("--gpu3d")) cli.set("video.gpu3d", "true");
     else if (flag("--preload-rom")) cli.set("cart.preload", "true");
     else if (flag("--no-preload-rom")) cli.set("cart.preload", "false");
     else if (flag("--no-gpu3d")) cli.set("video.gpu3d", "false");
+    else if (arg("--gpu3d-scale")) cli.set("video.gpu3d_scale", argv[++i]);
     else if (flag("--version")) { std::printf("DSperate %s (%s)\n", kDsperateVersion, kDsperateCommit); return 0; }
     else if (flag("--help")) { std::fputs(kUsage, stderr); return 0; }
     else if (argv[i][0] == '-' && argv[i][1] == '-') { std::fprintf(stderr, "unknown option %s\n", argv[i]); std::fputs(kUsage, stderr); return 2; }
@@ -1378,7 +1372,7 @@ static int run(int argc, char** argv) {
   }
   auto apply_cli = [&] { for (const char* k : {"paths.bios9", "paths.bios7", "paths.firmware", "paths.saves", "paths.states", "video.scale", "video.dual_window", "video.layout", "video.screen", "video.pip_alpha", "video.screen_gap", "video.dominant_ratio", "video.dominant_threshold", "video.integer_scale",
                                               "video.fullscreen", "video.linear", "video.lcd_grid", "video.colour", "video.chunky", "video.chunky_threshold", "video.chunky_cell", "video.seam", "video.sink", "video.disp", "video.fbdev", "video.gpu_present", "video.vsync", "audio.enabled", "audio.volume",
-                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu3d", "cart.preload", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
+                                              "audio.mic", "emu.jit", "emu.timing", "emu.speed", "emu.limiter", "emu.pacing", "audio.buffer_size", "audio.latency_frames", "emu.frameskip", "emu.frameskip_mode", "emu.frameskip_capture", "video.aa", "video.gpu3d", "video.gpu3d_scale", "cart.preload", "emu.autosave_png", "emu.autoload", "cheevos.enabled", "cheevos.token_file", "cheevos.username"}) if (cli.has(k)) cfg.set(k, cli.str(k)); };
   apply_cli();
   const std::string bios9 = cfg.str("paths.bios9"), bios7 = cfg.str("paths.bios7");
   const std::string dsi_fw = cfg.str("paths.dsi_firmware");
@@ -1753,18 +1747,8 @@ sdl_ready:
     }
   }
   if (!open_displays(vs, display, display2)) { SDL_Quit(); return 1; }
-  // video.gpu3d (DS_GPU3D=1 overrides): the 3D layer on the GPU (Renderer3D::set_gpu).
-  // After the displays: the Vulkan device opens the DRM node, and under direct
-  // KMS the display must take master first.
-  {
-    const char* g = std::getenv("DS_GPU3D");
-    const bool want = g ? std::atoi(g) != 0 : cfg.flag("video.gpu3d", false);
-    apply_aa(nds, cfg.str("video.aa", "false"));   // before the raster starts: its MSAA is fixed at creation
-    // So is the edge cut: an enhanced launch builds the cut's raster once,
-    // not the MSAA one and then the cut on the first frame.
-    if (want) nds.gpu.set_edge_export(edge_cut_wanted(nds, display, display2, dual_window, true));
-    if (want) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); else std::fprintf(stderr, "gpu3d: on (%s)\n", nds.gpu3d.renderer().gpu_api()); }
-  }
+  std::string gpu3d_refused;   // set where video.gpu3d is on and no raster starts: told on screen once the frame loop runs
+  ds::u32 gpu3d_scale_asked = 1;   // the scale last given to the raster (it takes it at its next frame: Renderer3D::gpu_scale() is the one in use)
   // Let fullscreen windows take their final size before the ROM loads (see
   // Display::settle_step); bounded, in case no configure comes.
   {
@@ -1868,6 +1852,7 @@ sdl_ready:
   auto draw_overlay_frame = [&](const std::function<void(const ds::sdl::Canvas&)>& paint) {
     const int menu_screen = dual_window ? 0 : display.current_layout().primary;
     const u32* fb[2];
+    nds.gpu.resolve_split3d();
     for (int i = 0; i < 2; ++i) {
       std::memcpy(menu_fb[i].data(), nds.gpu.framebuffer(i), menu_fb[i].size() * 4);
       ds::sdl::dim_framebuffer(menu_fb[i].data(), static_cast<u32>(menu_fb[i].size()));
@@ -1909,6 +1894,48 @@ sdl_ready:
   auto draw_notice_frame = [&](const std::string& title, const char* line2, const char* line3) {
     draw_overlay_frame([&](const ds::sdl::Canvas& c) { ds::sdl::draw_notice(c, title.c_str(), line2, line3); });
   };
+  // The Vulkan raster's shaders for (aa, scale), compiled ahead of the raster's own start or rebuild
+  // (Raster3D::warm) on a worker, with a notice if it takes more than a moment: the first time a setting is used
+  // it is seconds on the Mali-G52, and a frozen picture with no word looked like a hang. `page`: the display is
+  // already in page mode (the pause menu is up).
+  // `scale` and every scale under it: the raster runs no finer than the largest view shows and at 1x where the
+  // windows cannot merge its image (gpu3d_scale_now), so a 4x setting meets 2x on a change of layout. Without
+  // MSAA those are other pipelines (4x draws straight into the record), a second or more on the G52 the first
+  // time; with it, or already built, each is a few milliseconds.
+  auto warm_gpu3d = [&](bool aa, ds::u32 scale, bool page) {
+    const ds::sdl::OffRealtime off_rt;   // the worker inherits it
+    std::atomic<bool> done{false};
+    std::thread worker([&] { for (ds::u32 n = scale >= 4 ? 4 : scale >= 2 ? 2 : 1; n >= 1; n /= 2) ds::gpu::Raster3D::warm(aa, n); done = true; });
+    const Uint32 start = SDL_GetTicks();
+    Uint32 last_step = start;
+    int dots = 0;
+    bool shown = false;
+    while (!done) {
+      SDL_PumpEvents();
+      const Uint32 now = SDL_GetTicks();
+      if (now - start < 300) { SDL_Delay(10); continue; }   // a setting compiled before never shows it
+      if (!shown && !page) display.set_page(true);
+      shown = true;
+      if (now - last_step >= 250) { dots = (dots + 1) % 4; last_step = now; }
+      const std::string line2 = tr("COMPILING SHADERS") + std::string(static_cast<size_t>(dots), '.');
+      draw_notice_frame("GPU 3D", line2.c_str(), tr("FIRST TIME ONLY"));
+      SDL_Delay(50);
+    }
+    worker.join();
+    if (shown && !page) display.set_page(false);
+  };
+  // video.gpu3d (DS_GPU3D=1 overrides): the 3D layer on the GPU (Renderer3D::set_gpu).
+  // After the displays: the Vulkan device opens the DRM node, and under direct
+  // KMS the display must take master first. And once a notice can be drawn.
+  {
+    const char* g = std::getenv("DS_GPU3D");
+    const bool want = g ? std::atoi(g) != 0 : cfg.flag("video.gpu3d", false);
+    apply_aa(nds, cfg.str("video.aa", "false"));   // before the raster starts: its MSAA is fixed at creation
+    gpu3d_scale_asked = gpu3d_scale_now(cfg.num("video.gpu3d_scale", 1), display, display2, dual_window);
+    nds.gpu3d.renderer().set_gpu_scale(gpu3d_scale_asked);   // and its scale
+    if (want) warm_gpu3d(nds.gpu3d.renderer().aa(), std::max<ds::u32>(gpu3d_scale_asked, static_cast<ds::u32>(std::max(1, cfg.num("video.gpu3d_scale", 1)))), false);   // a first launch compiles its shaders: said on screen
+    if (want) { std::string why; if (!nds.gpu3d.renderer().set_gpu(true, &why)) { std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); gpu3d_refused = why.empty() ? "?" : why; } else std::fprintf(stderr, "gpu3d: on (%s)\n", nds.gpu3d.renderer().gpu_api()); }
+  }
   bool rom_cancelled = false;   // the last load_rom_notice was stopped with B
   // Loads a ROM with an "unpacking" notice if it takes more than a moment.
   // Load runs on a worker; this thread pumps events (B/quit cancels) and
@@ -2050,7 +2077,7 @@ sdl_ready:
   Session session;
   session.open(nds, cfg, rom_path, save_arg);
 
-  cfg.set("video.aa", aa_enhanced(cfg.str("video.aa", "false")) ? "enhanced" : aa_on(cfg.str("video.aa", "false")) ? "true" : "false");
+  cfg.set("video.aa", aa_on(cfg.str("video.aa", "false")) ? "true" : "false");
   apply_aa(nds, cfg.str("video.aa", "false"));
   apply_colour(nds, cfg.str("video.colour", "off"));
   if (!boot_firmware || nds.dsi) nds.setup_direct_boot();   // on a DSi this is the NAND boot
@@ -2299,6 +2326,7 @@ sdl_ready:
   apply_limiter();
   const double ticks_per_ns = static_cast<double>(SDL_GetPerformanceFrequency()) / 1e9;
 
+  int gpu3d_scale = cfg.num("video.gpu3d_scale", 1);   // video.gpu3d_scale; what the raster runs at is gpu3d_scale_now()
   const bool show_fps = std::getenv("DS_FPS") != nullptr;
   // Same 60-frame measurement as the DS_FPS log line; holds the last value between measurements.
   bool fps_osd = cfg.flag("video.fps", false);
@@ -2356,8 +2384,18 @@ sdl_ready:
   int ff_since = 0;           // frames since the last present, for fast forward's ff_skip
   std::vector<u32> cursor_fb(ds::SCREEN_W * ds::SCREEN_H);   // bottom screen with the pen crosshair
   std::vector<u32> osd_fb(ds::SCREEN_W * ds::SCREEN_H);      // primary screen with the slot digit / FPS counter
-  std::vector<u32> flash_fb[2] = {std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H), std::vector<u32>(ds::SCREEN_W * ds::SCREEN_H)};   // both screens under the screenshot flash
-  int flash_left = 0;                                        // frames of screenshot flash still to show
+  // DS_SPLIT_STAT=1: where each split screen went, said at exit.
+  struct MergeStat {
+    u64 live = 0, shown = 0, windows = 0, drawn_over = 0, gone_live = 0, gone_shown = 0;
+    ~MergeStat() {
+      if (std::getenv("DS_SPLIT_STAT") && (live || shown || windows || drawn_over || gone_live || gone_shown))
+        std::fprintf(stderr, "merge3d: screens merged in the present: %llu with the frame's 3D, %llu showing a captured frame; left at 1x: %llu the windows could not merge, %llu drawn over (cursor, flash, labels), %llu / %llu (3D / captured) whose image was gone\n",
+                     static_cast<unsigned long long>(live), static_cast<unsigned long long>(shown), static_cast<unsigned long long>(windows), static_cast<unsigned long long>(drawn_over),
+                     static_cast<unsigned long long>(gone_live), static_cast<unsigned long long>(gone_shown));
+    }
+  } merge_stat;
+  std::vector<u32> merge_expect[2];   // DS_MERGE3D_CHECK: each split screen as the CPU merges it
+  bool shot_notice = false;                                  // the pending screenshot was asked for by the player: say how it went
   int slot_shown = 0;                                        // frames left to show the slot field
   std::string slot_text;                                     // ... and what it says
   auto show_slot = [&](const std::string& text) { slot_text = text; slot_shown = SLOT_OSD_FRAMES; };
@@ -2394,6 +2432,7 @@ sdl_ready:
   };
   if (cfg.flag("emu.dsi_nand_shortcuts", false)) sync_nand_shortcuts(true);
   std::string shortcuts_note;   // what the last change of the row did, for a toast
+  std::string gpu3d_note = std::move(gpu3d_refused);   // why GPU 3D did not start (at launch, or from its row), for a toast
   std::vector<ds::sdl::Menu::GameEntry> games =
       boot_firmware && nds.cart ? enumerate_library(cfg) : std::vector<ds::sdl::Menu::GameEntry>{};
   menu.set_games(&games);
@@ -2552,6 +2591,7 @@ sdl_ready:
     bool per_game = false;
     // Pointer, not a copy: transports come up after this host is built.
     const bool* net_live = nullptr;
+    const Disp* display2 = nullptr;   // the second window's display under dual_window
 
     Host(ds::sdl::Config& c, NDS& n, Disp& d, VideoSetup& v, const std::string& gi, const std::string& pi, ds::sdl::Input& in)
         : cfg(c), nds(n), display(d), vs(v), global_ini(gi), game_ini(pi), input(in) {}
@@ -2863,10 +2903,8 @@ sdl_ready:
         if (net_live && *net_live) return tr("NOT DURING A NETWORK SESSION");
         return cfg.num("emu.frameskip", 0) > 0 ? "" : tr("ONLY WITH FRAMESKIP ON");
       case ds::sdl::Dep::PanelEffects:
-        if (display.rga_present()) return "";   // off: exact at whole-number scales, bilinear between
         return panel_effects() ? "" : tr("THIS SCREEN SCALES IN HARDWARE");
       case ds::sdl::Dep::GridSeam:
-        if (display.rga_present()) return std::strcmp(s.key, "video.seam") == 0 ? tr("THE RGA DRAWS THE DARK GRID ONLY") : "";
         if (!panel_effects()) return tr("THIS SCREEN SCALES IN HARDWARE");
         return flag("video.linear", false) ? tr("BILINEAR IS ON") : "";
       case ds::sdl::Dep::Chunky:
@@ -2910,6 +2948,26 @@ sdl_ready:
         return nds.slot2 && nds.slot2->kind() == ds::slot2::Kind::RumblePak ? "" : tr("NO RUMBLE PAK IN SLOT 2");
       case ds::sdl::Dep::SolarSensor:
         return nds.gba_cart() && nds.gba_cart()->solar_sensor() ? "" : tr("NO BOKTAI CARTRIDGE IN SLOT 2");
+      case ds::sdl::Dep::Gpu3dScale: {
+        // What gpu3d_scale_now() holds the raster to 1x for, said on the row. The config for what the menu can
+        // change (so a row just set greys this one at once), the display for the rest.
+        const char* const api = nds.gpu3d.renderer().gpu_api();
+        if (!*api) return flag("video.gpu3d", false) ? tr("GPU 3D IS NOT AVAILABLE HERE") : tr("ONLY WITH GPU 3D ON");
+        if (std::strcmp(api, "Vulkan") != 0) return tr("VULKAN ONLY");
+        if (flag("video.linear", false)) return tr("BILINEAR IS ON");
+        if (cfg.str("video.colour", "off") != "off") return tr("NOT WITH COLOUR CORRECTION");
+        Disp::MergeBlock b = display.merge3d_block();
+        if (b == Disp::MergeBlock::None && display2) b = display2->merge3d_block();
+        switch (b) {
+          case Disp::MergeBlock::NoVulkanPresent: return tr("NEEDS THE VULKAN PRESENT");
+          case Disp::MergeBlock::Bilinear: return tr("BILINEAR IS ON");
+          case Disp::MergeBlock::Colour: return tr("NOT WITH COLOUR CORRECTION");
+          case Disp::MergeBlock::ChunkySource: return tr("NOT WITH CHUNKY ON");
+          case Disp::MergeBlock::SeamBlend: return tr("NOT WITH BLENDED SEAMS AT THIS SIZE");
+          case Disp::MergeBlock::None: break;
+        }
+        return "";
+      }
       }
       return "";
     }
@@ -2919,6 +2977,7 @@ sdl_ready:
   host.reconfigure_input = [&] { input.configure(cfg); };
   host.fw_override = fw_override;
   host.net_live = &net_live;
+  host.display2 = dual_window ? &display2 : nullptr;
   host.reopen = [&] { reopen_display(); };
   // Whole layout re-read from the config in one go. Mode is the LAYOUT
   // row's pending choice if one was made, else the live one (a hotkey or
@@ -2985,9 +3044,19 @@ sdl_ready:
       session.refresh_analog(nds, cfg);
       return;
     }
-    if (is("video.aa")) { apply_aa(nds, v); return; }
+    if (is("video.aa")) {
+      ds::gpu::Renderer3D& r3 = nds.gpu3d.renderer();
+      if (*r3.gpu_api() && aa_on(v) != r3.aa()) warm_gpu3d(aa_on(v), static_cast<ds::u32>(std::max(1, gpu3d_scale)), true);   // the raster is rebuilt for it at the next frame
+      apply_aa(nds, v);
+      return;
+    }
     if (is("video.colour")) { apply_colour(nds, v); return; }
-    if (is("video.gpu3d")) { std::string why; if (!nds.gpu3d.renderer().set_gpu(on, &why)) std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); return; }
+    if (is("video.gpu3d")) { std::string why; if (on) warm_gpu3d(nds.gpu3d.renderer().aa(), static_cast<ds::u32>(std::max(1, gpu3d_scale)), true); if (!nds.gpu3d.renderer().set_gpu(on, &why)) { std::fprintf(stderr, "gpu3d: unavailable (%s), drawing on the CPU\n", why.c_str()); gpu3d_note = why.empty() ? "?" : why; } return; }
+    if (is("video.gpu3d_scale")) {
+      gpu3d_scale = std::atoi(v.c_str());
+      if (*nds.gpu3d.renderer().gpu_api()) warm_gpu3d(nds.gpu3d.renderer().aa(), static_cast<ds::u32>(std::max(1, gpu3d_scale)), true);
+      return;
+    }
     if (is("video.gpu_present")) { host.reopen_wanted = true; return; }
     if (is("video.fps")) { fps_osd = on; if (on && !show_fps) { fps_mark = SDL_GetPerformanceCounter(); emu_ticks = draw_ticks = wait_ticks = 0; } return; }
     if (is("video.pip_touch_hold")) { pip_touch_hold = std::max(0, std::atoi(v.c_str())); return; }
@@ -3024,13 +3093,14 @@ sdl_ready:
     VLOG("%s\n", p ? "paused" : "resumed");
   };
   // A framed, four-second notice drawn over the game. One at a time.
-  struct Toast { const char* header = nullptr; std::string title, detail; u32 points = 0; int frames = 0; };
+  struct Toast { const char* header = nullptr; std::string title, detail; u32 points = 0; int frames = 0; bool shot = false; };   // shot: a screenshot's notice (one at a time)
   std::deque<Toast> toast_queue;
   Toast toast_now;
   int toast_left = 0;
   ds::sdl::Rect toast_last{};          // what the canvas has to take back out
   constexpr int TOAST_FRAMES = 240;    // four seconds: long enough to read two lines
   constexpr int TOAST_INFO_FRAMES = 150;
+  constexpr int TOAST_SHOT_FRAMES = 90;   // a screenshot's notice: a glance
   // DSi state loaded without an SD card. Twice a toast's time.
   auto sd_note_toast = [&] {
     if (nds.sd_card_note.empty()) return;
@@ -3072,6 +3142,9 @@ sdl_ready:
   // --lan-join. What a session takes away, it gives back on the way out.
   // Set when a guest heard nobody: see begin_guest_scan below.
   bool guest_retry_armed = false, radio_was_on = false, scanning = false;
+  // net.mode = join with no answer yet: keep trying from the frame loop.
+  bool join_pending = false;
+  Uint32 next_join_ms = 0;
   bool knobs_held = false;
   int held_speed = 100; std::string held_limiter = "auto";
   int  held_fs_limit = 0;
@@ -3112,9 +3185,29 @@ sdl_ready:
       std::fprintf(stderr, "net: the frame limiter is back where it was -- the session is over\n");
     }
   };
+  // Keep each line to about 24 characters: toast_box truncates past two
+  // thirds of the DS screen width.
+  auto net_toast = [&](const char* title, const char* detail, int frames) {
+    Toast t;
+    t.header = tr("LOCAL WIRELESS");
+    t.title = title;
+    if (detail) t.detail = detail;
+    t.frames = frames;
+    toast_queue.push_back(std::move(t));
+  };
+  // net.lan_timeout_ms (DS_LAN_TIMEOUT_MS wins): how long one MP wait may
+  // hold the frame. Over a Wi-Fi access point, raise it before the games give up.
+  auto make_lan = [&] {
+    auto l = std::make_unique<ds::net::LanMp>();
+    const char* env = std::getenv("DS_LAN_TIMEOUT_MS");
+    l->set_recv_timeout_ms(env ? std::atoi(env) : static_cast<int>(cfg.num("net.lan_timeout_ms", ds::net::LanMp::kDefaultRecvTimeoutMs)));
+    if (l->recv_timeout_ms() != ds::net::LanMp::kDefaultRecvTimeoutMs) VLOG("lan: MP waits bounded at %d ms\n", l->recv_timeout_ms());
+    return l;
+  };
   set_net_mode = [&](const std::string& mode) {
     // Down first: a guest says goodbye rather than going silent.
-    if (lan) { lan->end_session(); nds.io.wifi.set_transport(nullptr); lan.reset(); }
+    join_pending = false;
+    if (lan) { lan->cancel_join(); lan->end_session(); nds.io.wifi.set_transport(nullptr); lan.reset(); }
     if (slirp) { nds.io.set_net_driver(nullptr); slirp->stop(); slirp.reset(); }
     const bool was_live = net_live;
     net_live = false;
@@ -3145,16 +3238,27 @@ sdl_ready:
         VLOG("internet: up, DNS %s\n", where.c_str());
       }
     } else if (mode == "auto" || mode == "guest" || mode == "host" || mode == "join") {
-      lan = std::make_unique<ds::net::LanMp>();
+      lan = make_lan();
       bool up = lan->ok();
       if (up && (mode == "auto" || mode == "guest")) {
         // Same scan either way; auto may fall back to hosting, guest may not.
         const auto role = lan->start_auto(lan_name, 2500, 16, mode == "auto");
         up = role != ds::net::LanMp::Role::None;
         if (up) VLOG("netplay: %s\n", role == ds::net::LanMp::Role::Host ? "no session heard, hosting" : ("joined " + lan->peer_name()).c_str());
+      } else if (up && mode == "join") {
+        // Not start_client: a guest launched before its host would give up
+        // after one try. Wait a moment for a host that is already up, then
+        // keep the attempt running from the frame loop (join_pending).
+        up = lan->begin_join(lan_name, lan_join) && lan->step_join(2000) == 1;
+        if (!up && lan->ok()) {
+          join_pending = true;
+          next_join_ms = SDL_GetTicks() + 1000;
+          std::fprintf(stderr, "lan: %s not answering yet (%s); still trying\n", lan_join, lan->error().c_str());
+          net_toast(tr("WAITING FOR HOST"), lan_join, TOAST_INFO_FRAMES);
+          return;
+        }
       } else if (up) {
-        up = mode == "join" ? lan->start_client(lan_name, lan_join)
-                            : lan->start_host(lan_host ? lan_host : lan_name, 16);
+        up = lan->start_host(lan_host ? lan_host : lan_name, 16);
       }
       if (!up) {
         std::fprintf(stderr, "lan: %s\n", lan->error().c_str());
@@ -3184,19 +3288,9 @@ sdl_ready:
   // early). Spread across frames, unlike start_auto's blocking scan.
   Uint32 scan_began_ms = 0;
   constexpr Uint32 kScanMs = 2500;   // as start_auto: a host beacons once a second
-  // Keep each line to about 24 characters: toast_box truncates past two
-  // thirds of the DS screen width.
-  auto net_toast = [&](const char* title, const char* detail, int frames) {
-    Toast t;
-    t.header = tr("LOCAL WIRELESS");
-    t.title = title;
-    if (detail) t.detail = detail;
-    t.frames = frames;
-    toast_queue.push_back(std::move(t));
-  };
   auto begin_guest_scan = [&] {
     guest_retry_armed = false;
-    if (!lan) lan = std::make_unique<ds::net::LanMp>();
+    if (!lan) lan = make_lan();
     if (!lan->ok() || !lan->start_discovery()) {
       std::fprintf(stderr, "lan: %s\n", lan->error().c_str());
       lan.reset();
@@ -3764,7 +3858,7 @@ sdl_ready:
         if (!session.game_ini.empty()) ds::sdl::Config::store(session.game_ini, "video.pip_corner", Disp::corner_name(l.corner));
         break;
       }
-      case A::Screenshot: if (paused) screenshot(nds, session.shots_dir, display.current_layout()); else shot_pending = true; break;
+      case A::Screenshot: if (paused) screenshot(nds, session.shots_dir, display.current_layout()); else { shot_pending = true; shot_notice = true; } break;
       case A::Lid: input.set_lid(!input.lid()); VLOG("lid: %s\n", input.lid() ? "closed" : "open"); if (input.lid()) flush_save(); break;
       case A::SlotNext: state_slot = (state_slot + 1) % 10; show_slot(std::to_string(state_slot)); VLOG("state slot %d\n", state_slot); break;
       case A::SlotPrev: state_slot = (state_slot + 9) % 10; show_slot(std::to_string(state_slot)); VLOG("state slot %d\n", state_slot); break;
@@ -3813,6 +3907,7 @@ sdl_ready:
         // Dual-window: `display` is opened with only_screen 0, so it's the
         // top screen. Otherwise the layout's primary screen.
         const int menu_screen = dual_window ? 0 : display.current_layout().primary;
+        nds.gpu.resolve_split3d();
         const u32* src[2] = {nds.gpu.framebuffer(0), nds.gpu.framebuffer(1)};
         const u32* fb[2];
         for (int i = 0; i < 2; ++i) {
@@ -3990,6 +4085,27 @@ sdl_ready:
     // A screenshot keeps the game's own colours: when the core corrects, it
     // waits for the next drawn frame, copied before the correction.
     if (shot_pending && !shot_raw && nds.gpu.colour_on_cpu()) { nds.gpu.request_raw_frame(); shot_raw = true; }
+    // The 3D merge in the Vulkan present (core/gpu/split3d.h): the GPU
+    // raster's frames reach the panel from its own image, with no readback.
+    // It is how a raster above 1x (video.gpu3d_scale) reaches the panel. At
+    // 1x, where the readback is nearly free, it only costs the present's GPU
+    // time, so there it is off unless DS_MERGE3D=1 asks (=0: never, and a
+    // finer raster shows as its 1x record).
+    {
+      static const int merge_env = [] { const char* e = std::getenv("DS_MERGE3D"); return e && *e ? std::atoi(e) != 0 : -1; }();
+      // The raster follows the setting and the windows (rebuilt at its next frame; frames in between show at the old scale).
+      {
+        ds::gpu::Renderer3D& r3 = nds.gpu3d.renderer();
+        const ds::u32 want = gpu3d_scale_now(gpu3d_scale, display, display2, dual_window);
+        if (want != gpu3d_scale_asked) {
+          if (*r3.gpu_api()) warm_gpu3d(r3.aa(), want, paused);
+          gpu3d_scale_asked = want;
+        }
+        r3.set_gpu_scale(want);
+      }
+      const bool merge3d = merge_env >= 0 ? merge_env != 0 : nds.gpu3d.renderer().gpu_scale() > 1;
+      nds.gpu.set_split3d_present(merge3d && display.merge3d_ok() && (!dual_window || display2.merge3d_ok()));
+    }
     const bool skipped = nds.gpu.will_skip_frame();
     // Games that render one screen per frame (the other via capture) show one
     // stale screen right after a skip; draw the block through and present its last frame.
@@ -4041,12 +4157,42 @@ sdl_ready:
     const Uint64 t0 = SDL_GetPerformanceCounter();
 #if DSPERATE_NET
     if (lan) lan->process();   // ENet and discovery, once per frame, on this thread
+    // Under DS_VERBOSE, the MP waits every 600 frames of a live session: the
+    // first thing to look at when a game reports a communication error.
+    if (lan && lan->active() && verbose() && nds.frame_count % 600 == 0) {
+      static unsigned last_n = 0, last_to = 0; static double last_ms = 0; static Uint32 last_tick = 0;
+      const Uint32 now_tick = SDL_GetTicks();
+      if (last_tick) {
+        const Uint32 wall = now_tick - last_tick;
+        VLOG("lan pacing: 600 frames in %ums (%.1f fps), %u waits, %.1f ms waiting, %u timeouts (max %.1f ms so far), radios %04x\n",
+             wall, wall ? 600000.0 / wall : 0.0, lan->wait_count() - last_n, lan->wait_total_ms() - last_ms,
+             lan->wait_timeouts() - last_to, lan->wait_max_ms(), lan->connected_mask());
+      }
+      last_tick = now_tick;
+      last_n = lan->wait_count(); last_ms = lan->wait_total_ms(); last_to = lan->wait_timeouts();
+    }
     if (slirp) slirp->process();
     // Edge-triggered: the game switching its radio on is when we look too.
     {
       const bool on_air = nds.io.wifi.tx_frames() > 0;
       if (on_air && !radio_was_on && guest_retry_armed && !scanning) begin_guest_scan();
       radio_was_on = on_air;
+      if (join_pending && lan) {
+        if (!lan->joining()) {
+          if (static_cast<Sint32>(SDL_GetTicks() - next_join_ms) >= 0 && !lan->begin_join(lan_name, lan_join))
+            next_join_ms = SDL_GetTicks() + 1000;
+        } else if (const int r = lan->step_join(0); r > 0) {
+          join_pending = false;
+          nds.io.wifi.set_transport(lan.get());
+          net_live = true;
+          take_away_for_session();
+          menu.set_network_session(true);
+          VLOG("lan: joined %s as player %d\n", lan_join, lan->my_id());
+          net_toast(tr("JOINED A SESSION"), lan_join, TOAST_INFO_FRAMES);
+        } else if (r < 0) {
+          next_join_ms = SDL_GetTicks() + 1000;
+        }
+      }
       if (scanning) {
         lan->scan_step();
         if (SDL_GetTicks() - scan_began_ms >= kScanMs) finish_guest_scan();
@@ -4081,6 +4227,17 @@ sdl_ready:
 #endif
     toast_step();
 
+    if (!gpu3d_note.empty()) {
+      // video.gpu3d is on and no raster started: the picture is the CPU's, which would otherwise go unsaid.
+      Toast t;
+      t.header = tr("GPU 3D UNAVAILABLE");
+      t.title = tr("DRAWING 3D ON THE CPU");
+      t.detail = std::move(gpu3d_note);   // the raster's own words, in the menu's capitals
+      for (char& c : t.detail) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      t.frames = TOAST_FRAMES;
+      toast_queue.push_back(std::move(t));
+      gpu3d_note.clear();
+    }
     if (!shortcuts_note.empty()) {
       Toast t;
       t.header = tr("NAND SHORTCUTS");
@@ -4137,7 +4294,8 @@ sdl_ready:
 
     const Uint64 t1 = SDL_GetPerformanceCounter();
     if (present) {
-      const bool cursor = input.stylus_visible() && !log.reading();
+      static const bool cursor_env = std::getenv("DS_SHOW_CURSOR") != nullptr;   // debug: the crosshair where the pen rests, with no pad driving it
+      const bool cursor = (input.stylus_visible() && !log.reading()) || cursor_env;
       // Crosshair is drawn in DS pixels, so it shrinks with a small view;
       // scale back up by the reduction so it stays findable.
       int cursor_size = input.stylus_size();
@@ -4155,8 +4313,6 @@ sdl_ready:
       if (fast) fps_text = "FF";
       if (fps_osd) fps_text += (fast ? " " : "") + std::to_string(std::clamp(fps_value, 0, 999));
       const bool fps_field = !fps_text.empty();
-      const u32 flash_alpha = flash_left > 0 ? static_cast<u32>(255 * flash_left / FLASH_FRAMES) : 0;
-      if (flash_left > 0) --flash_left;
       // Overlays follow Layout::primary to stay where the player's
       // looking. Dual window has no primary, so top screen.
       const Disp::Layout& osd_l = display.current_layout();
@@ -4187,15 +4343,6 @@ sdl_ready:
             note(toast_last);
             if (!toast_on()) toast_last = {};
           }
-          if (flash_alpha) {
-            draw_flash(c, flash_alpha);
-            display.note_canvas_draw_all();
-            ds::sdl::Display::CanvasView cv2;
-            if (dual_window && display2.canvas(cv2)) {
-              draw_flash(ds::sdl::Canvas{cv2.px, cv2.pitch, cv2.w, cv2.h}, flash_alpha);
-              display2.note_canvas_draw_all();
-            }
-          }
         } else if (target[osd_screen].px) {
           const auto tgt_canvas = [](const ds::sdl::Display::Target& t) {
             return ds::sdl::Canvas{t.px, t.pitch, t.xrun ? static_cast<int>(t.xrun[ds::SCREEN_W]) : static_cast<int>(ds::SCREEN_W), static_cast<int>(t.h)};
@@ -4205,36 +4352,73 @@ sdl_ready:
           if (fps_field) draw_label(c, fps_text.c_str(), true);
           if (menu_over_live) menu.draw(c);
           if (toast_on()) draw_toast_on(c);
-          if (flash_alpha) for (int i = 0; i < 2; ++i) if (target[i].px) draw_flash(tgt_canvas(target[i]), flash_alpha);
         }
         display.present();
         if (dual_window) display2.present();
       } else {
-        // The edge cut (core/gpu/edge_cut.h): video.aa = enhanced on the GPU
-        // raster cuts 3D edges at panel density in the Vulkan present (the RGA
-        // cannot) instead of drawing with 4x MSAA, which plain video.aa keeps:
-        // the cut's GPU frame is cheaper, but its edge plane costs the
-        // emulation thread (edge_line, the compositor's and capture's edge
-        // words) ~5 ms a frame in Golden Sun: Dark Dawn. The CPU raster shows
-        // the hardware's blend, its accurate AA. DS_EDGE_CUT=0 keeps MSAA;
-        // DS_EDGE_CUT=1 cuts with plain video.aa too, and the CPU raster's
-        // edges (the reference the GPU's are checked against). Takes effect
-        // from the next frame.
-        // Chunky cells are no edges to cut: no edge plane while they are drawn.
-        nds.gpu.set_edge_export(!display.source_chunky() && edge_cut_wanted(nds, display, display2, dual_window, nds.gpu3d.renderer().gpu_active()));
-        ds::sdl::EdgePlanes edges;
-        if (nds.gpu.edge_export() && !at_src)
-          for (int s = 0; s < 2; ++s) { edges.plane[s] = nds.gpu.edge_plane(s); edges.rows[s] = nds.gpu.edge_rows(s); edges.frame[s] = nds.gpu.framebuffer(s); }
+        // The 3D merge: a frame the core split (set_split3d_present, below
+        // the frame loop's top) goes to the present with the raster's image
+        // of its 3D layer. Where this frame cannot be merged there after all
+        // (something is drawn into the screen here, the layout changed, the
+        // image is gone), the CPU merges it now from the record.
+        // The crosshair goes on the overlay plane where the bottom screen's
+        // window has one (the Vulkan present), at the panel's resolution,
+        // as the labels and notices do: the screen under it stays the
+        // core's own frame, and its 3D the raster's image.
+        ds::sdl::Display& cursor_win = dual_window && display2.only_screen() == 1 ? display2 : display;
+        ds::sdl::Display::CanvasView ccv{};
+        ds::frontend::Rect crect{};
+        const bool cursor_on_canvas = cursor && !at_src && cursor_win.vk_present() && cursor_win.screen_rect(1, crect) && crect.w > 0 && crect.h > 0 &&
+                                      cursor_win.canvas(ccv) && crect.x >= 0 && crect.y >= 0 && crect.x + crect.w <= ccv.w && crect.y + crect.h <= ccv.h && crect.w < 65536;
+        ds::sdl::Merge3D merge;
+        {
+          const bool osd_drawn = (slot_osd || fps_field || toast_on() || menu_over_live) && !display.canvas_capable();
+          const bool windows_ok = !at_src && display.merge3d_ok() && (!dual_window || display2.merge3d_ok());
+          static const bool check = std::getenv("DS_MERGE3D_CHECK") != nullptr;
+          ds::gpu::Gpu::Split3DScreen sf[2];
+          bool have[2] = {nds.gpu.split3d_screen(0, &sf[0]), nds.gpu.split3d_screen(1, &sf[1])};
+          bool resolve = false;
+          for (int s = 0; s < 2; ++s) {
+            if (!have[s]) continue;
+            ds::gpu::Layer3D layer;
+            const bool drawn_over = (cursor && s == 1 && !cursor_on_canvas) || (osd_drawn && osd_screen == s);
+            const bool have_layer = windows_ok && !drawn_over && nds.gpu3d.renderer().gpu_layer(sf[s].gen, &layer);
+            ++(!windows_ok ? merge_stat.windows : drawn_over ? merge_stat.drawn_over : !have_layer ? (sf[s].live ? merge_stat.gone_live : merge_stat.gone_shown) : sf[s].live ? merge_stat.live : merge_stat.shown);
+            if (!have_layer) {
+              // A screen showing a capture is whole as it is (the 1x picture); this frame's 3D has to be merged in.
+              resolve |= sf[s].live;
+              continue;
+            }
+            ds::sdl::Merge3D::Screen& m = merge.s[s];
+            m.words = sf[s].words; m.coords = sf[s].coords; m.lines = sf[s].lines; m.scrolled = sf[s].scrolled;
+            m.view = layer.view; m.scale = layer.scale; m.wait = layer.wait; m.gen = layer.gen; m.live = sf[s].live;
+            m.later = layer.later; m.job = layer.job; m.from = layer.from;
+            if (check && layer.scale == 1) { merge_expect[s].resize(ds::SCREEN_W * ds::SCREEN_H); nds.gpu.merge_split3d(s, merge_expect[s].data()); m.expect = merge_expect[s].data(); }
+          }
+          if (resolve) nds.gpu.resolve_split3d();
+          static const bool nogpu = std::getenv("DS_MERGE3D_NOGPU") != nullptr;   // debug: the split's CPU side alone (the picture lacks its 3D)
+          if (nogpu) merge = ds::sdl::Merge3D{};
+        }
         const u32* fb[2] = {nds.gpu.framebuffer(0), nds.gpu.framebuffer(1)};
         if (at_src)   // each screen from the window that shows it
           for (int s = 0; s < 2; ++s) fb[s] = (dual_window && display2.only_screen() == s ? display2 : display).source_frame(s);
-        if (cursor) {
+        if (cursor_on_canvas) {
+          static u16 run[ds::SCREEN_W + 1];   // blit_rect reads the view's width from the last entry
+          run[ds::SCREEN_W] = static_cast<u16>(crect.w);
+          draw_cursor(CursorDst{ccv.px + static_cast<size_t>(crect.y) * ccv.pitch + crect.x, ccv.pitch, static_cast<u32>(crect.h), run}, input.stylus_x(), input.stylus_y(), cursor_size);
+          // What it covered: the arms and their outline, in DS pixels, as the view scales them.
+          const int ext = 3 * std::max(1, cursor_size) + std::max(1, cursor_size) + 2;
+          const int x0 = std::max(0, input.stylus_x() - ext), x1 = std::min<int>(ds::SCREEN_W, input.stylus_x() + ext + 1);
+          const int y0 = std::max(0, input.stylus_y() - ext), y1 = std::min<int>(ds::SCREEN_H, input.stylus_y() + ext + 1);
+          if (x1 > x0 && y1 > y0)
+            cursor_win.note_canvas_draw(crect.x + crect.w * x0 / static_cast<int>(ds::SCREEN_W), crect.y + crect.h * y0 / static_cast<int>(ds::SCREEN_H),
+                                        crect.w * x1 / static_cast<int>(ds::SCREEN_W) - crect.w * x0 / static_cast<int>(ds::SCREEN_W), crect.h * y1 / static_cast<int>(ds::SCREEN_H) - crect.h * y0 / static_cast<int>(ds::SCREEN_H));
+        } else if (cursor) {
           std::memcpy(cursor_fb.data(), fb[1], cursor_fb.size() * 4);
           draw_cursor(CursorDst{cursor_fb.data(), ds::SCREEN_W, ds::SCREEN_H, nullptr}, input.stylus_x(), input.stylus_y(), cursor_size);
           fb[1] = cursor_fb.data();
         }
-        // Overlay layer where there is one: labels go on the panel's own
-        // pixels. Flash stays below: on the overlay it'd upload every frame.
+        // Overlay layer where there is one: labels go on the panel's own pixels.
         ds::sdl::Display::CanvasView ocv;
         const bool want_osd = slot_osd || fps_field || toast_on() || menu_over_live;
         const bool osd_on_canvas = display.canvas_capable() && want_osd && display.canvas(ocv);
@@ -4256,18 +4440,13 @@ sdl_ready:
           if (menu_over_live) menu.draw(od);
           fb[osd_screen] = osd_fb.data();
         }
-        // Last: a screen still pointing at the GPU's own buffer is copied out first.
-        if (flash_alpha) for (int i = 0; i < 2; ++i) {
-          if (fb[i] == nds.gpu.framebuffer(i)) { std::memcpy(flash_fb[i].data(), fb[i], flash_fb[i].size() * 4); fb[i] = flash_fb[i].data(); }
-          draw_flash(ds_canvas(const_cast<u32*>(fb[i])), flash_alpha);
-        }
         // A GPU present goes to the present thread on the aux core
         // (present_thread.h); DS_PRESENT_SYNC=1 keeps it here.
         static const bool present_sync = std::getenv("DS_PRESENT_SYNC") != nullptr;
 
-        if (!present_sync && display.gpu_present() && (!dual_window || display2.gpu_present())) {
+        if (!present_sync && display.async_present() && (!dual_window || display2.async_present())) {
           ds::sdl::Display* const ds_[2] = {&display, &display2};
-          ds::sdl::Display::draw_async(ds_, dual_window ? 2 : 1, fb, &edges);
+          ds::sdl::Display::draw_async(ds_, dual_window ? 2 : 1, fb, &merge);
         } else {
           // Pinned (thread layout), the emulation thread presents here as a
           // normal task: the kernel work a present queues on this core (a
@@ -4280,8 +4459,8 @@ sdl_ready:
           int rt_pol = 0; sched_param rt_sp{};
           const bool drop_rt = present_nort && pthread_getschedparam(pthread_self(), &rt_pol, &rt_sp) == 0 && (rt_pol == SCHED_RR || rt_pol == SCHED_FIFO);
           if (drop_rt) { sched_param z{}; sched_setscheduler(0, SCHED_OTHER, &z); }
-          display.draw(fb, &edges);
-          if (dual_window) display2.draw(fb, &edges);
+          display.draw(fb, &merge);
+          if (dual_window) display2.draw(fb, &merge);
           if (drop_rt) sched_setscheduler(0, rt_pol, &rt_sp);
         }
       }
@@ -4290,13 +4469,24 @@ sdl_ready:
     audio.push(nds, fast || limiter_off);
     if (shot_pending && present && (!shot_raw || nds.gpu.raw_frame_ready())) {
       shot_pending = false;
+      bool shot_ok = false;
       if (shot_raw) {
         const u32* raw[2] = {nds.gpu.raw_frame(0), nds.gpu.raw_frame(1)};
-        screenshot(nds, session.shots_dir, display.current_layout(), raw);
+        shot_ok = screenshot(nds, session.shots_dir, display.current_layout(), raw);
         nds.gpu.release_raw_frame();
         shot_raw = false;
-      } else screenshot(nds, session.shots_dir, display.current_layout());
-      flash_left = FLASH_FRAMES;   // from the next frame: this one is already on the panel and in the file
+      } else shot_ok = screenshot(nds, session.shots_dir, display.current_layout());
+      // A notice instead of the old white flash: it is drawn on the overlay
+      // from the next frame, so neither this file nor the game's picture has it.
+      if (shot_notice && (toast_queue.empty() || !toast_queue.back().shot)) {
+        Toast t;
+        t.shot = true;
+        t.header = tr("SCREENSHOT");
+        t.title = shot_ok ? tr("SAVED") : tr("COULD NOT BE SAVED");
+        t.frames = TOAST_SHOT_FRAMES;
+        toast_queue.push_back(std::move(t));
+      }
+      shot_notice = false;
     }
     if (pause_pending && present) {
       pause_pending = false;
@@ -4434,7 +4624,7 @@ sdl_ready:
     ++frames;
     rt_budget.nap();
     // DS_SHOT_AT=N: a screenshot after frame N, for offscreen/replay runs.
-    if (static const long shot_at = [] { const char* v = std::getenv("DS_SHOT_AT"); return v ? std::atol(v) : -1L; }(); shot_at >= 0 && frames == static_cast<u64>(shot_at)) shot_pending = true;
+    if (static const long shot_at = [] { const char* v = std::getenv("DS_SHOT_AT"); return v ? std::atol(v) : -1L; }(); shot_at >= 0 && frames == static_cast<u64>(shot_at)) { shot_pending = true; shot_notice = true; }
     // DS_LAUNCH_AT=<frame>:<path>: start that game at that frame, as the picker would.
     if (static const char* la = std::getenv("DS_LAUNCH_AT"); la && std::strchr(la, ':') && frames == std::strtoull(la, nullptr, 10)) launch_game(std::strchr(la, ':') + 1);
     if (nds.cart && nds.cart->sram_dirty()) {
