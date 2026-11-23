@@ -35,6 +35,8 @@ class Gpu {
 public:
   explicit Gpu(NDS& nds);
   ~Gpu();
+  // Before the 3D engine goes (NDS::~NDS): nothing of this one may still be drawing from it.
+  void stop_jobs() { join_worker(); late_join(); }
   void reset();
 
   // Scheduler callbacks.
@@ -89,7 +91,15 @@ public:
   void vram_remap_end(bool trapped);  // after: re-arm it
   void set_lazy(bool on) { lazy_enabled_ = on; }   // off: per-line rendering (tests)
 
-  const u32* framebuffer(int screen) const { return fb_[screen].data(); }   // 0 = top, 1 = bottom
+  const u32* framebuffer(int screen) const { return pages_[front_[screen & 1]].fb[screen & 1].data(); }   // 0 = top, 1 = bottom
+  // For a frontend that shows the frame from another thread: between frames, hands over the frame just finished
+  // and moves the core's drawing to its other page, so what framebuffer() and split3d_screen() return from here
+  // on is not written while the next frame is drawn (nothing to copy). It is written again by the frame after
+  // that, and only once hand_frame has been called for the next one: the reader must be done by then.
+  // The picture is what one buffer would hold: lines no frame has drawn since the pages changed over come from
+  // the other page, at the next frame's start, from where readers get that frame whether it is handed or not.
+  // No effect while the output stage scales into frontend buffers.
+  void hand_frame();
   // Colour correction of every shown line (core/gpu/colour.h), after the
   // output stage and before the scaler or framebuffer, so fb_ holds the
   // corrected colours. Joins any lines in flight; set between frames.
@@ -287,16 +297,48 @@ private:
   void update_phase();
   u16 master_bright_g_[2] = {0, 0};   // guest-visible; the engines hold the render-side value
   u32 capcnt_ = 0;
+  void capcnt_set(u32 v);
   bool capture_on_ = false;
   std::array<u16, 16> fifo_{};
   u8 fifo_rd_ = 0, fifo_wr_ = 0;
   alignas(16) std::array<u16, 256> fifo_line_{};
   bool run_fifo_ = false;
-  std::array<std::array<u32, SCREEN_W * SCREEN_H>, 2> fb_{};
   u32 hires_n_ = 1;
   std::vector<u32> hires_fb_[2];   // hires_frame
   u64 hires_rows_[2][3] = {};   // hires_row
   void output_hires(const Engine2D& en, int screen, u32 line);
+  // What a frame leaves for its readers, twice over (hand_frame): the screens, and the 3D split's words, XY
+  // words, per-line brightness words (Split3DScreen::lines) and brightness registers.
+  struct Page {
+    std::array<std::array<u32, SCREEN_W * SCREEN_H>, 2> fb{};
+    std::vector<u32> split_fb[2], split_xy[2];   // 256x192 each (allocated on first use)
+    u32 split_mb[2][SCREEN_H] = {};
+    u16 split_reg[2][SCREEN_H] = {};
+  };
+  Page pages_[2];
+  // Per screen: the page its lines are drawn into, and the one its readers get between frames. A screen that
+  // draws no line in a frame (every line repeated) keeps showing the page it had, with nothing copied.
+  u32 page_[2] = {}, front_[2] = {};
+  u64 page_drawn_[2][3] = {};           // per screen, a bit a line: drawn into pages_[page_] since it became the drawing page
+  Page& wp(int s) { return pages_[page_[s]]; }
+  Page& fp(int s) { return pages_[front_[s]]; }
+  const Page& fp(int s) const { return pages_[front_[s]]; }
+  void patch_page();                    // the drawing page's undrawn lines, from the front page
+  void settle_pages();                  // the readers' pages from here (hand_frame, begin_frame)
+  // Repeated lines (DS_2D_REPEAT=0 off, 1 on, 2 verify): a game showing a 3D scene on each screen at 30 fps
+  // (Golden Sun: Dark Dawn) shows on the screen engine B drives the captured image engine A showed there the
+  // frame before, fed back a row per HBlank. A line engine B would draw from one row equal to the bank row
+  // engine A displayed on that screen and line the frame before (Engine2D::repeat_row, a hash of the 512
+  // bytes) is not drawn: the page keeps that frame's pixels and split words (patch_page). Verify draws it and
+  // compares. a_hash_: per frame parity and screen, engine A's displayed bank rows (VRAM display, no master
+  // brightness), on the worker that draws engine A, read from line 0 of the next frame.
+  int repeat_mode_ = 1;
+  u32 a_cur_ = 0;
+  u64 a_hash_[2][2][SCREEN_H] = {}, a_whash_[2][2][SCREEN_H] = {};   // the row's pixels; the line's split words and brightness words as engine A left them
+  bool a_ok_[2][2][SCREEN_H] = {};
+  u32 a_n_[2][2] = {};
+  std::atomic<u64> rep_lines_{0}, rep_checked_{0}, rep_bad_{0};
+  bool repeat_line(int e, u32 line);
   std::shared_ptr<const kern::ColourLut> colour_lut_;   // null: off
   ColourProfile colour_ = ColourProfile::Off;
   bool colour_cpu_ = true;
@@ -388,6 +430,18 @@ private:
   // only the windows of a batching engine, and A's in a lag frame.
   static constexpr u32 LAZY_FUTILE_LIMIT = 4, LAZY_PROBE_PERIOD = 64;
   u32  eng_futile_[2] = {0, 0};
+  // Engine A's batch handed in pieces. A game that takes the frame's picture as soon as the last line is
+  // drawn (Golden Sun: Dark Dawn copies each capture out of its bank by DMA at line 192) joins the batch the
+  // moment it is handed, and the emulation waits out all 192 lines of it. While that goes on (early_a_: frames
+  // left since such a join) the lines are handed as the frame goes, EARLY_A_LINES or more at a time and only
+  // when the piece before is done (one waiting for the frame's 3D holds the rest back, never the emulation),
+  // left in flight as a lag frame's line is (the trap over A's windows guards them): only the last piece is waited for. Not in
+  // a frame whose 3D may be the frame before's (the record would be asked for at the first piece, before the
+  // raster has had its time). DS_2D_EARLY=0: off; 2: in every frame that may (debug).
+  static constexpr u32 EARLY_A_LINES = 16, EARLY_A_HOLD = 60;
+  u32 early_a_ = 0;
+  bool early_ok_ = false;        // this frame (begin_frame)
+  bool early_inflight_ = false;  // a piece is in flight: engine B's lines are drawn beside it, with no join
   u32  eng_probe_in_[2] = {LAZY_PROBE_PERIOD, LAZY_PROBE_PERIOD};
   bool lazy_tried_ = false;       // last frame batched (its end state feeds eng_futile_)
   u32  frontier() const { return hblank_done_ ? line_ + 1u : line_; }   // first line a write now can still affect
@@ -509,7 +563,18 @@ private:
     u8 kind[SCREEN_H] = {};        // per line: 0 not captured, 1 the merged composite, 2 the 3D layer alone
     std::vector<Pixel> u;          // kind 1: the line without BG0 ...
     std::vector<u32> w;            // ... and its split words
+    std::vector<u16> px;           // the lines as late_fill writes them (late_lines), once `pre`
+    bool pre = false;
   };
+  // late_lines waits for a late capture's 3D frame and makes its lines again, into the LateCap alone. Line 0
+  // starts it on the 2D worker for the frame before's capture (late_prefill), which is idle from there to the
+  // frame's first lines, so late_fill on the emulation thread only copies. late_join before the worker is given
+  // anything else and before a LateCap is touched. DS_CAP_PRE=0: late_fill makes the lines itself.
+  void late_lines(LateCap& lc);
+  void late_prefill();
+  void late_join() { if (late_inflight_) { worker_.wait(static_cast<int>(JoinSite::Other)); late_inflight_ = false; late_job_ = false; } }
+  bool late_job_ = false, late_inflight_ = false;
+  u64 late_job_seq_ = 0;
   LateCap late_[2];
   u64 late_seq_ = 0;
   Renderer3D::FrameRef ref3d_exact_;   // a late frame's own 3D frame, waited for: for a line that shows the 1x record itself
@@ -521,15 +586,18 @@ private:
   // A late capture something took before the next frame's render (a read, a DMA out, a texture mapping) was
   // written again at once, which is the waiting capture with work added: late capture stands down for a while.
   u32 cap_backoff_ = 0;
+  // Each time in a row a late capture is taken early the stand-down doubles (10 s to about 10 min): a game that
+  // takes every capture at once (Golden Sun: Dark Dawn's copy-out DMA) paid for a failed try every 600 frames,
+  // a 20 ms frame every ten seconds.
+  static constexpr u32 CAP_BACKOFF_MIN = 600, CAP_BACKOFF_MAX = 38400;
+  u32 cap_backoff_len_ = CAP_BACKOFF_MIN;
+  void cap_stand_down() { cap_backoff_ = cap_backoff_len_; cap_backoff_len_ = std::min(cap_backoff_len_ * 2, CAP_BACKOFF_MAX); }
   // DS_SPLIT_STAT: capture frames; those that waited for their 3D frame while late capture stood down; late captures taken early, by what took them.
   u32 cap_frames_ = 0, cap_backoff_frames_ = 0, cap_taken_remap_ = 0, cap_taken_read_ = 0, cap_taken_dma_ = 0;
   u32 cap_idle_ = 0;   // frames since the last capture frame: a new run of captures starts by waiting (cap_clean_ from 0)
   u32 cap_untagged_seen_ = 0, cap_clean_ = 0, cap_late_frames_ = 0, cap_late_filled_ = 0;
   u64 split_lines_ = 0, split_resolved_ = 0, split_cap_merged_ = 0;   // DS_SPLIT3D=present: what the run split and merged back
   SplitFrame split_cur_, split_done_;
-  std::vector<u32> split_fb_[2], split_xy_[2];   // per screen: the words and the XY words, 256x192 (allocated on first use)
-  u32 split_mb_[2][SCREEN_H] = {};      // Split3DScreen::lines
-  u16 split_reg_[2][SCREEN_H] = {};     // the master brightness register of each split line
   u64 split_cap_shown_ = 0, split_cap_moved_ = 0, split_cap_changed_ = 0, split_cap_other_ = 0, split_cap_bad_ = 0, split_cap_checked_ = 0;
   // Lag mode: per-line frames hand BOTH engines' line to the
   // worker at its HBlank without waiting, joining at that line's HBlank or
@@ -548,7 +616,10 @@ private:
   u64 join_wait_ns_ = 0;
   void finish_a();
 public:
-  void journal_full() { join_worker(JoinSite::Journal); }   // Engine2D::queue on a full journal
+  // Engine2D::queue on a full journal: the engine's lines the pending writes
+  // are for are drawn now (which replays them in order), so what is left is
+  // the current line's.
+  void journal_full(int engine) { join_worker(JoinSite::Journal); catch_up(1u << engine); }
 private:
   static void worker_job(void* self);
 

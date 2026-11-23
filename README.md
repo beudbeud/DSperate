@@ -107,9 +107,18 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
   can be started directly through NAND title shortcuts.
 - **DSi hardware.** SD card slot backed by a host folder (synced back, deletions
   included), microphone, DSi Wi-Fi, PictoChat, and Download Play from the Menu.
+  The cameras see a still: a picture from `paths.dsi_photos` picked under DS
+  OPTIONS in the menu, or colour bars. There is no live camera.
 - **Save states, the recompiler, idle skip and fastmem** all work in DSi sessions.
-- **Not yet:** the DSP (titles that start it warn, and camera or DSP audio apps
-  will not work) and DSi-enhanced carts in DSi mode (they run as DS games).
+- **DSi-enhanced game cards** run as the DS games they also are. With
+  `emu.dsi_enhanced` (DSI ENHANCED GAMES in the menu, best set per game) and the
+  DSi BIOS pair they run as a DSi, booted straight from the card. Experimental,
+  and heavier: the DSi's CPU is twice as fast.
+- **The DSP.** The three programs Nintendo's SDK gave games (AAC, G711,
+  graphics) run as melonDS's high-level rewrites, with AAC decoded by FAAD2. Any
+  other DSP program runs on teakra, exactly and far slower than real time on a
+  handheld (the frontend says so). The DSi Sound app starts and reaches its menu;
+  its two modes do not load yet.
 
 ### Local wireless and internet
 
@@ -213,7 +222,9 @@ hardware. No DraStic code is in this tree. See [docs/techniques](docs/techniques
 
 Requires CMake ≥ 3.16, Ninja, a C++17 compiler, and SDL2 for the playable
 frontend. The vendored third-party code is miniz's DEFLATE decompressor,
-rcheevos, ENet and libslirp.
+rcheevos, ENet, libslirp, teakra (MIT), melonDS's DSP programs, FAAD2 (GPL-2.0-or-later;
+code from FAAD2 is copyright (c) Nero AG, www.nero.com) and stb_image (public domain / MIT; decodes the
+DSi cameras' still).
 
     cmake --preset host && cmake --build --preset host && ctest --preset host
 

@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "core/safe_file.h"
+#include <cerrno>
+#include <cstring>
 #include "config.h"
 
 #include <cstdio>
@@ -72,7 +75,10 @@ bool Config::load(const std::string& path) {
     const size_t eq = line.find('=');
     if (eq == std::string::npos) continue;
     std::string k = trim(line.substr(0, eq)), v = trim(line.substr(eq + 1));
-    if (const size_t c = v.find_first_of("#;"); c != std::string::npos) v = trim(v.substr(0, c));
+    // A comment after a value starts at a # or ; that follows a blank (or leads): one inside a word is the
+    // value's own (a path such as /roms/#1 or Disc;2 was cut there).
+    for (size_t c = v.find_first_of("#;"); c != std::string::npos; c = v.find_first_of("#;", c + 1))
+      if (c == 0 || v[c - 1] == ' ' || v[c - 1] == '\t') { v = trim(v.substr(0, c)); break; }
     const std::string key = section.empty() ? k : section + "." + k;
     if (retired(key)) { std::fprintf(stderr, "config: %s is retired (3D is drawn on the CPU only) and is ignored (%s)\n", key.c_str(), path.c_str()); continue; }
     kv_[key] = v;
@@ -106,14 +112,22 @@ bool Config::flag(const std::string& key, bool def) const {
   return def;
 }
 
-bool Config::store(const std::string& path, const std::string& key, const std::string& value) {
+bool Config::store(const std::string& file, const std::string& key, const std::string& value) {
+  // Through a link to the file it names: the replacement must not take the link's place.
+  std::string path = file;
+  if (char* real = ::realpath(file.c_str(), nullptr)) { path = real; std::free(real); }
   std::string sec, name;
   split_key(key, sec, name);
   std::vector<std::string> lines;
   {
+    // A file that is there and cannot be read is not an empty one: writing
+    // back what was read would leave it holding this one key.
+    errno = 0;
     std::ifstream f(path);
+    if (!f && errno != ENOENT) { std::fprintf(stderr, "config: cannot read %s: %s; not rewriting it\n", path.c_str(), std::strerror(errno)); return false; }
     std::string line;
     while (std::getline(f, line)) lines.push_back(line);
+    if (f.bad()) { std::fprintf(stderr, "config: cannot read all of %s; not rewriting it\n", path.c_str()); return false; }
   }
   size_t sec_start = std::string::npos, sec_end = lines.size();
   for (size_t i = 0; i < lines.size(); ++i) {
@@ -142,9 +156,10 @@ bool Config::store(const std::string& path, const std::string& key, const std::s
       lines.insert(lines.begin() + static_cast<long>(at), entry);
     }
   }
-  std::ofstream f(path);
-  if (!f) return false;
-  for (const std::string& l : lines) f << l << '\n';
+  std::string text, err;
+  for (const std::string& l : lines) { text += l; text += '\n'; }
+  // Never truncated in place: a failed or interrupted write leaves the old settings.
+  if (!write_file_atomic(path, text.data(), text.size(), err)) { std::fprintf(stderr, "config: %s\n", err.c_str()); return false; }
   return true;
 }
 
@@ -210,6 +225,8 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
 # games = /path/to/games        # the library the loader card lists on a firmware boot (.nds and .zip,
                                 # one level; DSiWare .nds/.dsi/.srl/.cia too, zipped or not, marked
                                 # [DSi]). Unset, the picker says so.
+# dsi_photos = /path/to/folder  # pictures the DSi's cameras can be shown (JPEG, PNG, BMP; one level).
+                                # [emu] dsi_camera_image names one; DS OPTIONS in the menu picks it
 # dsi_games = /path/to/folder   # the DSi games folder (e.g. a frontend's own DSiWare folder): where
                                 # [emu] dsi_nand_shortcuts keeps its .dspr.nds files. Unset: games
                                 # above. The loader card lists the shortcuts from here too
@@ -376,6 +393,21 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # Band Hero, which need it to start. Its frets are keys/pad grip_green,
                                 # grip_red, grip_yellow, grip_blue, and take those controls from the
                                 # DS buttons sharing them while the grip is in the slot
+# motion = auto                 # auto | retail | homebrew | off: a motion accessory in slot 2 when no
+                                # GBA game or Guitar Grip is. retail: the DS Motion Pack; homebrew: the
+                                # DS Motion Card. auto: the pack, for Tony Hawk's Motion (which needs it)
+# motion_source = auto          # auto | pad | sensor | stick: what tilts it. pad: the controller's
+                                # own accelerometer (SDL); sensor: the handheld's (Linux IIO); stick:
+                                # a stick, up to 45 degrees each way. auto: the first of those there
+                                # is. A replay holds it flat
+# motion_stick = right          # right | left: the stick that tilts. It is the accessory's while one is
+                                # in the slot: the pen, stick_dpad and stick_face let go of it (the pen
+                                # has it back while stylus_hold is held). A handheld with one stick: left
+# motion_matrix =               # nine numbers: the rotation from the sensor's axes to the console's
+                                # (X right, Y up the screen, Z towards you), for a sensor the system
+                                # gives no mount matrix for. Empty: the system's, or none. A
+                                # controller's is taken as held like a handheld; lying flat, face
+                                # up: 1 0 0 0 0 -1 0 1 0
 # solar = 5                     # the solar sensor of a Boktai cartridge: 0 (dark) to 10 (full sun)
 
 [emu]
@@ -400,11 +432,17 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # emulation on its own, the 2D engines each paired with a 3D band,
                                 # audio/SDL/driver threads on the interrupt core (DS_PIN overrides)
 # jit = true                    # false = interpreter (much slower; for comparison)
-# timing = fast                 # CPU cycle model: fast (the default: a constant cost per memory access
+# timing = fast                 # CPU cycle model: fast (the default for DS games; a DSi session's is
+                                # exact, which its system software needs: a constant cost per memory access
                                 # and per jump; much cheaper to emulate, and games cannot tell in
                                 # practice) | exact (melonDS's per-access model: memory wait states,
                                 # fetch/data overlap, the ARM7's main-RAM rules; also the cartridge
-                                # bus clock per ROM word, which fast skips). Read at launch
+                                # bus clock per ROM word, which fast skips) | turbo (fast, with the
+                                # emulated ARM9 charged less than the console's: a game that drops
+                                # its own frame rate under load, as Okamiden does from 30 to 20 fps,
+                                # holds the higher one. It is not the console's speed: some games
+                                # may run wrong, glitch or hang with it, so it is not a default
+                                # and is best set per game). Read at launch
 # idle_skip = 1                 # skip a CPU busy-wait: 0 = never | 1 = only the GXSTAT swap poll |
                                 # all = every proven poll loop
 # autosave = false              # on quit, save a state to the hidden "auto" slot
@@ -417,6 +455,13 @@ R"(# DSperate settings. Command-line flags override this file. Two files next
                                 # card may take nothing else): opening one starts the title straight from the NAND
                                 # (its saves and settings), skipping the DSi Menu and its slow load.
                                 # Kept up to date at every start; false removes every .dspr.nds there
+# dsi_enhanced = false          # EXPERIMENTAL. true: a DSi-enhanced game card (one that runs on both
+                                # consoles) runs as a DSi, booted straight from the card. Needs the
+                                # DSi BIOS pair, and costs frame time: the DSi's CPU is twice as fast.
+                                # false: it runs as the DS game it also is. Best set in a game's own
+                                # file (the menu's SAVE TO row). A DSi-only card always runs as a DSi
+# dsi_camera_image =            # a file name in [paths] dsi_photos: the still both DSi cameras see,
+                                # cut to 4:3 from its middle. Empty: colour bars. There is no live camera
 # dsi_hide_installed = false    # --dsi-mode: hide the NAND dump's own DSiWare from the DSi Menu for
                                 # the session (the dump is never changed); --dsi-hide-installed
 # autoload = false              # when a game starts and its auto slot exists, resume from it instead

@@ -27,7 +27,6 @@ u32 W = 256, H = 192;   // 256 * scale x 192 * scale (Lean::create). One raster 
 // 3 translucent A, 4 translucent B, 5 shadow prep, 6 shadow, 7 shadow mask (+ clear), 8 opaque in the tail, 9 resolve, 10 record readback.
 const u32 g_skip = std::getenv("DS_LEAN_SKIP") ? static_cast<u32>(std::strtoul(std::getenv("DS_LEAN_SKIP"), nullptr, 16)) : 0u;
 constexpr u32 kTexelWords = 2u << 20;   // 8 MB of decoded texels, as the Vulkan raster's arena
-constexpr u32 kMaxDraws = 4096;
 constexpr u32 kPullW = 1024;            // the polygon/vertex textures' width in texels
 // The stencil layout and the pass kinds, vk_lean.cpp's.
 constexpr u32 S_DRAWN = 0x80, S_MASK = 0x40, S_T = 0x20, S_CODE = 0x1F;
@@ -57,8 +56,12 @@ struct Lean::Impl {
   GLuint ssbo_polys[kSlots] = {}, ssbo_post[kSlots] = {}, ubo_frame[kSlots] = {}, ssbo_texels = 0;
   void* map_polys[kSlots] = {}; void* map_post[kSlots] = {}; void* map_frame[kSlots] = {}; u32* map_texels = nullptr;
   GLuint tex_polys[kSlots] = {}, tex_verts[kSlots] = {};
-  GLuint t_col = 0, t_fog = 0, t_ids = 0, t_ds = 0, t_res = 0;
-  GLuint fbo_draw = 0, fbo_res = 0;
+  // [1]: the frames that anti-alias edges (aa, aa_now): the fog attachment with the edge byte and the polygon's id
+  // beside the fog bit, and programs that write and read them. Their own set, because every frame paid for them
+  // otherwise: on the Mali-G31, Spirit Tracks' GPU time 5.22 -> 5.57 ms with nothing anti-aliased.
+  GLuint t_col = 0, t_fog[2] = {}, t_ids = 0, t_ds = 0, t_res = 0;
+  GLuint fbo_draw[2] = {}, fbo_res = 0;
+  bool aa = false, aa_now = false;
   GLuint pbo_out[kSlots] = {};
   const u32* map_out[kSlots] = {};
   // The record copied out of the mapped PBOs (uncached memory on Mali) into host memory the compositor can read (finish_slot).
@@ -68,6 +71,46 @@ struct Lean::Impl {
   // draw's colour attachment is read back as the record, its alpha byte decoded in the copy out of the PBO.
   bool direct = true;
   bool direct_slot[kSlots] = {};
+  // The crack fill (ds_crack.glsl has the test and why; gl_resolve.frag fills the frames that have a resolve): on a
+  // frame without one, here on the decoded record. DS_LEAN_CRACK=0: off.
+  bool crack = true;
+  std::vector<std::pair<u32, u32>> crack_fills;
+  void fill_cracks(u32* rec, u32 fw, u32 fh, int longest) {
+    const auto in = [&](int x, int y) { return x >= 0 && y >= 0 && x < static_cast<int>(fw) && y < static_cast<int>(fh); };
+    const auto full = [&](int x, int y) { return !in(x, y) || (rec[static_cast<u32>(y) * W + static_cast<u32>(x)] >> 24) == 31u; };   // the frame's edge counts
+    const auto cand = [&](int x, int y) { return in(x, y) && (rec[static_cast<u32>(y) * W + static_cast<u32>(x)] >> 24) == 0u; };
+    crack_fills.clear();
+    for (int y = 0; y < static_cast<int>(fh); ++y) {
+      const u32* row = rec + static_cast<u32>(y) * W;
+      for (int x = 0; x < static_cast<int>(fw); ++x) {
+        if (row[x] >> 24) continue;
+        for (int ax = 0; ax < 2; ++ax) {   // crack_axis: the line runs down (the two beside it left and right), then across
+          const int dx = ax, dy = 1 - ax, sx = dy, sy = dx;
+          if (!full(x - sx, y - sy) || !full(x + sx, y + sy)) continue;
+          int len = 1; bool ok = true;
+          for (int sg = -1; sg <= 1 && ok; sg += 2) {
+            ok = false;
+            for (int k = 1; k <= longest; ++k) {
+              const int qx = x + sg * k * dx, qy = y + sg * k * dy;
+              if (!full(qx - sx, qy - sy) || !full(qx + sx, qy + sy)) break;
+              if (full(qx, qy)) { ok = true; break; }
+              if (!cand(qx, qy) || ++len > longest) break;
+            }
+          }
+          if (!ok) continue;
+          int ax0 = x - sx, ay0 = y - sy, ax1 = x + sx, ay1 = y + sy;   // the two beside it: one of them twice at the frame's edge
+          if (!in(ax0, ay0)) { ax0 = ax1; ay0 = ay1; }
+          if (!in(ax1, ay1)) { ax1 = ax0; ay1 = ay0; }
+          const u32 p0 = rec[static_cast<u32>(ay0) * W + static_cast<u32>(ax0)], p1 = rec[static_cast<u32>(ay1) * W + static_cast<u32>(ax1)];
+          u32 m = 31u << 24;
+          for (u32 sh = 0; sh < 24; sh += 8) m |= ((((p0 >> sh) & 63u) + ((p1 >> sh) & 63u) + 1u) >> 1) << sh;
+          crack_fills.emplace_back(static_cast<u32>(y) * W + static_cast<u32>(x), m);
+          break;
+        }
+      }
+    }
+    for (const auto& [i, m] : crack_fills) rec[i] = m;   // after the tests: a filled pixel is no full neighbour to the next
+  }
   void copy_out(u32 slot) {
     u32* dst = (down ? fine_host : out_host)[slot].data();
     std::memcpy(dst, map_out[slot], sizeof(u32) * W * H);   // out of the uncached map in one go; decoded in cached memory
@@ -85,18 +128,23 @@ struct Lean::Impl {
       const u32* row = dst + (y * scale + c) * W + c;
       for (u32 x = 0; x < 256; ++x) o[y * 256 + x] = row[x * scale];
     }
+    if (crack) fill_cracks(dst, W, H, scale > 1 ? static_cast<int>(32u * scale) : 8);   // ds_crack.glsl, crack_longest
   }
   // Program sets: 0 with mode-2 (toon / highlight) shading, 1 without (DS_TOON false: a frame without mode-2
   // polygons). [set][W-depth][variant].
-  GLuint prog_draw[2][2][V_COUNT] = {};
+  GLuint prog_draw[2][2][2][2][V_COUNT] = {};   // [wireframe][edge AA][no toon][W depth][variant]
+  // The wireframe programs (DS_WIRE: a run of alpha-0 polygons, whose edges alone are drawn) are built when a frame
+  // first has such a run: few games draw one, and each is a program more to compile at start otherwise.
+  GLuint vs_lean[2] = {};   // the vertex stage, [edge AA], kept for them
+  bool build_draw(u32 wire, u32 ea, u32 sp, u32 wd, u32 v, std::string* err);
   bool toon_now = true;     // ... has mode-2 (toon / highlight) polygons
-  GLuint prog_prep = 0, prog_mask = 0, prog_resolve = 0;
+  GLuint prog_prep = 0, prog_mask = 0, prog_resolve[2] = {};
   // Edge marking (vk_lean.cpp's Impl::mark has the design): t_ids as the draw's third attachment holds the id word,
   // and prog_mark recolours the record's edge pixels, in fbo_res or, for a frame whose colour attachment is the
   // record, in fbo_col. DS_LEAN_EDGEMARK=0 leaves the pass out.
   bool mark = false, mark_on = true;
   GLuint prog_mark = 0, fbo_col = 0;
-  GLint loc_base_draw[2][2][V_COUNT] = {}, loc_base_prep = -1;
+  GLint loc_base_draw[2][2][2][2][V_COUNT] = {}, loc_base_prep = -1;
   GLuint vao = 0;
   GLuint query[kSlots] = {};
   // The slot state: submit() on the job thread, the readers on any. A
@@ -129,7 +177,7 @@ struct Lean::Impl {
   void drop_sync(u32 slot) { if (sync[slot]) { a->eglDestroySyncKHR(dpy, sync[slot]); sync[slot] = nullptr; } }
   void bind_thread() { if (a->eglGetCurrentContext() != ctx) a->eglMakeCurrent(dpy, surf, surf, ctx); }
   // A pass kind's program and state (set_state), the stencil reference per run; the program's u_base location.
-  GLint use_kind(u32 kind, bool wbuf, bool eq, u32 ref);
+  GLint use_kind(u32 kind, bool wbuf, bool eq, u32 ref, bool wire = false);
   // Every program drawn once in every pass kind's state at creation, so the
   // driver compiles its variants (Mali: blend and masks fold into the
   // fragment shader) before the first frame that needs them, not during it
@@ -162,8 +210,9 @@ struct Lean::Impl {
       // Ours on this thread: the objects go now. On another thread (the
       // job thread, which keeps its last context) EGL frees them with the
       // context once that thread binds another.
-      for (auto& set : prog_draw) for (auto& row : set) for (GLuint p : row) if (p) a->glDeleteProgram(p);
-      for (GLuint p : {prog_prep, prog_mask, prog_resolve, prog_mark}) if (p) a->glDeleteProgram(p);
+      for (GLuint v : vs_lean) if (v) a->glDeleteShader(v);
+      for (auto& w : prog_draw) for (auto& e : w) for (auto& set : e) for (auto& row : set) for (GLuint p : row) if (p) a->glDeleteProgram(p);
+      for (GLuint p : {prog_prep, prog_mask, prog_resolve[0], prog_resolve[1], prog_mark}) if (p) a->glDeleteProgram(p);
       if (fbo_col) a->glDeleteFramebuffers(1, &fbo_col);
       for (u32 i = 0; i < kSlots; ++i) {
         GLuint bufs[4] = {ssbo_polys[i], ssbo_post[i], ubo_frame[i], pbo_out[i]};
@@ -172,10 +221,10 @@ struct Lean::Impl {
         a->glDeleteTextures(2, texs);
       }
       if (ssbo_texels) a->glDeleteBuffers(1, &ssbo_texels);
-      GLuint texs[5] = {t_col, t_fog, t_ids, t_ds, t_res};
-      a->glDeleteTextures(5, texs);
-      GLuint fbos[2] = {fbo_draw, fbo_res};
-      a->glDeleteFramebuffers(2, fbos);
+      GLuint texs[6] = {t_col, t_fog[0], t_fog[1], t_ids, t_ds, t_res};
+      a->glDeleteTextures(6, texs);
+      GLuint fbos[3] = {fbo_draw[0], fbo_draw[1], fbo_res};
+      a->glDeleteFramebuffers(3, fbos);
       if (vao) a->glDeleteVertexArrays(1, &vao);
       if (timing && a->glDeleteQueriesEXT) a->glDeleteQueriesEXT(kSlots, query);
       a->eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
@@ -221,6 +270,13 @@ GLuint compile(Api& a, GLenum kind, const std::string& src, std::string* why) {
   const char* p = src.c_str(); const GLint len = static_cast<GLint>(src.size());
   a.glShaderSource(s, 1, &p, &len);
   a.glCompileShader(s);
+  // DS_GL_DUMP_SHADERS=DIR: every stage as it is compiled, includes and defines in, to DIR/NN.vert|frag in the
+  // order of Lean::create (for the Mali offline compiler; a value that is no directory only prints a rejected one).
+  if (const char* dir = std::getenv("DS_GL_DUMP_SHADERS"); dir && std::strchr(dir, '/')) {
+    static int n = 0;
+    char name[512]; std::snprintf(name, sizeof name, "%s/%02d.%s", dir, n++, kind == GL_VERTEX_SHADER ? "vert" : "frag");
+    if (std::FILE* f = std::fopen(name, "w")) { std::fwrite(src.data(), 1, src.size(), f); std::fclose(f); }
+  }
   GLint ok = 0; a.glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
   if (!ok) {
     char log[2048] = {}; a.glGetShaderInfoLog(s, sizeof log - 1, nullptr, log);
@@ -264,7 +320,6 @@ void* persistent(Api& a, GLenum target, GLuint* buf, size_t size, bool read) {
 }
 
 std::unique_ptr<Lean> Lean::create(bool aa, std::string* why, u32 scale) {
-  (void)aa;   // no MSAA on this backend
   auto fail_null = [&](const char* m) { if (why) *why = m; return nullptr; };
   if (std::getenv("DS_GL3D") && std::atoi(std::getenv("DS_GL3D")) == 0) return fail_null("disabled (DS_GL3D=0)");
   Api& a = gl_api();
@@ -369,25 +424,37 @@ std::unique_ptr<Lean> Lean::create(bool aa, std::string* why, u32 scale) {
   // Attachments: colour, fog bit, edge marking's id word, depth/stencil;
   // the resolved record. Float depth first, as vk_lean.cpp.
   d.t_col = tex2d(a, GL_RGBA8, W, H);
-  d.t_fog = tex2d(a, GL_R8, W, H);
+  d.t_fog[0] = tex2d(a, GL_R8, W, H);
   d.mark = d.indexed;   // the third attachment needs its own write mask
   d.mark_on = !(std::getenv("DS_LEAN_EDGEMARK") && std::atoi(std::getenv("DS_LEAN_EDGEMARK")) == 0);
+  // Edge anti-aliasing (video.aa on this raster; gl_lean.frag): its byte is kept from the opaque passes by a write
+  // mask of the fog attachment's own. DS_GL_EDGEAA=0 for A/B.
+  d.aa = aa && d.indexed && !(std::getenv("DS_GL_EDGEAA") && std::getenv("DS_GL_EDGEAA")[0] == '0');
+  // r the fog bit, g the edge byte, b the polygon's id. (RGBA4, twelve bits packed over three channels, measured
+  // slower on the G31 than this: Spirit Tracks 6.0 ms against 5.64, with 5.23 for a frame that marks no edge.)
+  if (d.aa) d.t_fog[1] = tex2d(a, GL_RGBA8, W, H);
   if (d.mark) d.t_ids = tex2d(a, GL_R32UI, W, H);
   d.t_res = tex2d(a, GL_RGBA8, W, H);
   const bool d24 = std::getenv("DS_LEAN_D24") && std::atoi(std::getenv("DS_LEAN_D24")) != 0;
-  for (int attempt = d24 ? 1 : 0; attempt < 2 && !d.fbo_draw; ++attempt) {
-    GLuint ds = tex2d(a, attempt == 0 ? GL_DEPTH32F_STENCIL8 : GL_DEPTH24_STENCIL8, W, H);
+  auto draw_fbo = [&](GLuint fog, GLuint ds) {
     GLuint fbo = 0; a.glGenFramebuffers(1, &fbo); a.glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.t_col, 0);
-    a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + 1, GL_TEXTURE_2D, d.t_fog, 0);
+    a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + 1, GL_TEXTURE_2D, fog, 0);
     if (d.mark) a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + 2, GL_TEXTURE_2D, d.t_ids, 0);
     a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, ds, 0);
     const GLenum bufs[3] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT0 + 1, GL_COLOR_ATTACHMENT0 + 2};
     a.glDrawBuffers(d.mark ? 3 : 2, bufs);
-    if (a.glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) { d.fbo_draw = fbo; d.t_ds = ds; }
-    else { a.glDeleteFramebuffers(1, &fbo); a.glDeleteTextures(1, &ds); }
+    if (a.glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) return fbo;
+    a.glDeleteFramebuffers(1, &fbo);
+    return GLuint{0};
+  };
+  for (int attempt = d24 ? 1 : 0; attempt < 2 && !d.fbo_draw[0]; ++attempt) {
+    GLuint ds = tex2d(a, attempt == 0 ? GL_DEPTH32F_STENCIL8 : GL_DEPTH24_STENCIL8, W, H);
+    if (GLuint fbo = draw_fbo(d.t_fog[0], ds)) { d.fbo_draw[0] = fbo; d.t_ds = ds; }
+    else a.glDeleteTextures(1, &ds);
   }
-  if (!d.fbo_draw) return fail("draw framebuffer incomplete");
+  if (d.fbo_draw[0] && d.aa && !(d.fbo_draw[1] = draw_fbo(d.t_fog[1], d.t_ds))) d.aa = false;
+  if (!d.fbo_draw[0]) return fail("draw framebuffer incomplete");
   a.glGenFramebuffers(1, &d.fbo_res); a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_res);
   a.glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.t_res, 0);
   if (a.glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return fail("resolve framebuffer incomplete");
@@ -410,40 +477,41 @@ std::unique_ptr<Lean> Lean::create(bool aa, std::string* why, u32 scale) {
     const bool wclip = !(std::getenv("DS_GL_WCLIP") && std::atoi(std::getenv("DS_GL_WCLIP")) == 0);
     d.wclip = wclip;
     const std::string vdefs = wclip ? "#define DS_WCLIP 1\n" : "";
+    const std::string aadef = "#define DS_EDGE_AA 1\n";
+    // The crack fill (gl_resolve.frag, gl_mark.frag; lean_crack.frag is the Vulkan raster's). DS_LEAN_CRACK=0: off.
+    d.crack = !(std::getenv("DS_LEAN_CRACK") && std::atoi(std::getenv("DS_LEAN_CRACK")) == 0);
+    const std::string crackdef = d.crack ? "#define DS_CRACK 1\n" : "";
     const GLuint vs_lean = compile(a, GL_VERTEX_SHADER, source(text_lean_vert(), vdefs), &err);
+    const GLuint vs_lean_aa = d.aa ? compile(a, GL_VERTEX_SHADER, source(text_lean_vert(), vdefs + aadef), &err) : 0;
+    if (d.aa && !vs_lean_aa) { if (why) *why = err; return nullptr; }
     const GLuint vs_fs = compile(a, GL_VERTEX_SHADER, source(text_fs_vert(), ""), &err);
     const GLuint fs_null = compile(a, GL_FRAGMENT_SHADER, source(text_null_frag(), ""), &err);
     if (!vs_lean || !vs_fs || !fs_null) { if (why) *why = err; return nullptr; }
-    const std::string fetch_defs = "#extension GL_ARM_shader_framebuffer_fetch : require\n#define DS_ALPHA_SEL 2\n#define DS_FETCH " + std::to_string(d.fetch) + "\n";
-    const std::string variant_defs[V_COUNT] = {"", "#define DS_EARLY 1\n", "#define DS_ALPHA_SEL 1\n", "#define DS_ALPHA_SEL 2\n", fetch_defs};
-    for (u32 sp = 0; sp < 2; ++sp) for (u32 wd = 0; wd < 2; ++wd) for (u32 v = 0; v < V_COUNT; ++v) {
+    d.vs_lean[0] = vs_lean; d.vs_lean[1] = vs_lean_aa;
+    for (u32 ea = 0; ea < (d.aa ? 2u : 1u); ++ea) for (u32 sp = 0; sp < 2; ++sp) for (u32 wd = 0; wd < 2; ++wd) for (u32 v = 0; v < V_COUNT; ++v) {
       if (v == V_FETCH && !d.fetch) continue;
-      const std::string defs = variant_defs[v] + (wd && !wclip ? "#define DS_WDEPTH 1\n" : "") + (sp == 1 ? "#define DS_TOON false\n" : "");
-      const GLuint fs = compile(a, GL_FRAGMENT_SHADER, source(text_lean_frag(), defs), &err);
-      GLuint& prog = d.prog_draw[sp][wd][v];
-      prog = link(a, vs_lean, fs, &err);
-      if (fs) a.glDeleteShader(fs);
-      if (!prog) { if (why) *why = err; return nullptr; }
-      a.glUseProgram(prog); sampler(a, prog, "polytex", 0); sampler(a, prog, "verttex", 1);
-      d.loc_base_draw[sp][wd][v] = a.glGetUniformLocation(prog, "u_base");
+      if (!d.build_draw(0, ea, sp, wd, v, &err)) { if (why) *why = err; return nullptr; }
     }
     d.prog_prep = link(a, vs_lean, fs_null, &err);
     d.prog_mask = link(a, vs_fs, fs_null, &err);
     if (!d.prog_prep || !d.prog_mask) { if (why) *why = err; return nullptr; }
     a.glUseProgram(d.prog_prep); sampler(a, d.prog_prep, "polytex", 0); sampler(a, d.prog_prep, "verttex", 1); d.loc_base_prep = a.glGetUniformLocation(d.prog_prep, "u_base");
-    const GLuint fs_res = compile(a, GL_FRAGMENT_SHADER, source(text_resolve_frag(), vdefs), &err);
-    d.prog_resolve = link(a, vs_fs, fs_res, &err);
-    if (fs_res) a.glDeleteShader(fs_res);
-    if (!d.prog_resolve) { if (why) *why = err; return nullptr; }
-    a.glUseProgram(d.prog_resolve); sampler(a, d.prog_resolve, "s_col", 2); sampler(a, d.prog_resolve, "s_depth", 3); sampler(a, d.prog_resolve, "s_fog", 4);
+    for (u32 ea = 0; ea < (d.aa ? 2u : 1u); ++ea) {
+      const GLuint fs_res = compile(a, GL_FRAGMENT_SHADER, source(text_resolve_frag(), vdefs + crackdef + (ea ? aadef : "")), &err);
+      GLuint& pr = d.prog_resolve[ea];
+      pr = link(a, vs_fs, fs_res, &err);
+      if (fs_res) a.glDeleteShader(fs_res);
+      if (!pr) { if (why) *why = err; return nullptr; }
+      a.glUseProgram(pr); sampler(a, pr, "s_col", 2); sampler(a, pr, "s_depth", 3); sampler(a, pr, "s_fog", 4);
+    }
     if (d.mark) {
-      const GLuint fs_mark = compile(a, GL_FRAGMENT_SHADER, source(text_mark_frag(), vdefs), &err);
+      const GLuint fs_mark = compile(a, GL_FRAGMENT_SHADER, source(text_mark_frag(), vdefs + crackdef), &err);
       d.prog_mark = link(a, vs_fs, fs_mark, &err);
       if (fs_mark) a.glDeleteShader(fs_mark);
       if (!d.prog_mark) { if (why) *why = err; return nullptr; }
       a.glUseProgram(d.prog_mark); sampler(a, d.prog_mark, "s_ids", 5);
     }
-    a.glDeleteShader(vs_lean); a.glDeleteShader(vs_fs); a.glDeleteShader(fs_null);
+    a.glDeleteShader(vs_fs); a.glDeleteShader(fs_null);
     a.glUseProgram(0);
   }
   a.glGenVertexArrays(1, &d.vao);
@@ -487,7 +555,7 @@ void set_state(Lean::Impl& d, u32 kind, bool eq, u32 ref, bool wbuf) {
   const GLboolean ids = (kind == P_OPAQUE || kind == P_OPAQUE_EARLY || kind == P_TRANS_OPQ) ? 1 : 0;
   const bool blend = kind == P_TRANS_B || kind == P_TRANS_B_DW || kind == P_SHADOW;
   if (d.indexed) {
-    a.glColorMaski(0, col, col, col, col); a.glColorMaski(1, col, 0, 0, 0); a.glColorMaski(2, ids, 0, 0, 0);
+    a.glColorMaski(0, col, col, col, col); a.glColorMaski(1, col, ids, ids, 0); a.glColorMaski(2, ids, 0, 0, 0);   // the edge byte and the id: the opaque passes' alone
     if (kind == P_TRANS_ONE || kind == P_TRANS_ONE_DW) {   // the shader blends the colour (framebuffer fetch); the fog bit's MIN stays here
       a.glDisablei(GL_BLEND, 0);
       a.glEnablei(GL_BLEND, 1); a.glBlendFuncSeparatei(1, GL_ONE, GL_ONE, GL_ONE, GL_ONE); a.glBlendEquationSeparatei(1, GL_MIN, GL_MIN);
@@ -505,14 +573,35 @@ void set_state(Lean::Impl& d, u32 kind, bool eq, u32 ref, bool wbuf) {
 }
 }
 
-GLint Lean::Impl::use_kind(u32 kind, bool wbuf, bool eq, u32 ref) {
+bool Lean::Impl::build_draw(u32 wire, u32 ea, u32 sp, u32 wd, u32 v, std::string* err) {
+  Api& g = *a;
+  const std::string fetch_defs = "#extension GL_ARM_shader_framebuffer_fetch : require\n#define DS_ALPHA_SEL 2\n#define DS_FETCH " + std::to_string(fetch) + "\n";
+  const std::string variant_defs[V_COUNT] = {"", "#define DS_EARLY 1\n", "#define DS_ALPHA_SEL 1\n", "#define DS_ALPHA_SEL 2\n", fetch_defs};
+  const std::string defs = variant_defs[v] + (wd && !wclip ? "#define DS_WDEPTH 1\n" : "") + (sp == 1 ? "#define DS_TOON false\n" : "") + (ea ? "#define DS_EDGE_AA 1\n" : "") + (wire ? "#define DS_WIRE 1\n" : "");
+  const GLuint fs = compile(g, GL_FRAGMENT_SHADER, source(text_lean_frag(), defs), err);
+  GLuint& prog = prog_draw[wire][ea][sp][wd][v];
+  prog = link(g, vs_lean[ea], fs, err);
+  if (fs) g.glDeleteShader(fs);
+  if (!prog) return false;
+  g.glUseProgram(prog); bound_prog = prog; sampler(g, prog, "polytex", 0); sampler(g, prog, "verttex", 1);
+  loc_base_draw[wire][ea][sp][wd][v] = g.glGetUniformLocation(prog, "u_base");
+  return true;
+}
+
+GLint Lean::Impl::use_kind(u32 kind, bool wbuf, bool eq, u32 ref, bool wire) {
   GLuint prog; GLint loc;
   if (kind == P_MASK_CLEAR) { prog = prog_mask; loc = -1; }
   else if (kind == P_SHADOW_PREP) { prog = prog_prep; loc = loc_base_prep; }
   else {
     const u32 v = kind == P_OPAQUE_EARLY ? V_EARLY : kind == P_TRANS_OPQ ? V_OPQ : (kind == P_TRANS_ONE || kind == P_TRANS_ONE_DW) ? V_FETCH : (kind == P_TRANS_A || kind == P_TRANS_B || kind == P_TRANS_A_DW || kind == P_TRANS_B_DW) ? V_TRANS : V_PLAIN;
     const u32 set = toon_now ? 0u : 1u;
-    prog = prog_draw[set][wbuf ? 1 : 0][v]; loc = loc_base_draw[set][wbuf ? 1 : 0][v];
+    u32 wi = wire && v != V_EARLY ? 1u : 0u;
+    const u32 ea = aa_now ? 1u : 0u, wd = wbuf ? 1u : 0u;
+    if (wi && !prog_draw[1][ea][set][wd][v]) {   // the first such run: built here
+      std::string err;
+      if (!build_draw(1, ea, set, wd, v, &err)) { std::fprintf(stderr, "gpu lean (OpenGL ES): wireframe program: %s\n", err.c_str()); wi = 0; }   // drawn filled
+    }
+    prog = prog_draw[wi][ea][set][wd][v]; loc = loc_base_draw[wi][ea][set][wd][v];
   }
   if (prog != bound_prog) { a->glUseProgram(prog); bound_prog = prog; }
   set_state(*this, kind, eq, ref, wbuf);
@@ -531,14 +620,15 @@ void Lean::Impl::warm() {
   g.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_texels);
   g.glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo_post[0]);
   g.glBindVertexArray(vao);
-  g.glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw);
   g.glViewport(0, 0, W, H);
   g.glEnable(GL_STENCIL_TEST);
+  for (u32 ea = 0; ea < (aa ? 2u : 1u); ++ea)
   for (u32 sp = 0; sp < 2; ++sp)
   for (u32 wd = 0; wd < 2; ++wd)
     for (u32 kind = 0; kind < P_COUNT; ++kind) {
       if ((kind == P_TRANS_ONE || kind == P_TRANS_ONE_DW) && !fetch) continue;
-      toon_now = sp == 0;
+      if (kind == 0) g.glBindFramebuffer(GL_FRAMEBUFFER, fbo_draw[ea]);
+      toon_now = sp == 0; aa_now = ea != 0;
       const GLint loc = use_kind(kind, wd != 0, false, 0);
       if (loc >= 0) g.glUniform1i(loc, 0);
       if (kind == P_MASK_CLEAR) g.glDrawArrays(GL_TRIANGLES, 0, 3); else g.glDrawArraysInstanced(GL_TRIANGLES, 0, 24, 1);
@@ -550,9 +640,12 @@ void Lean::Impl::warm() {
   g.glBindFramebuffer(GL_FRAMEBUFFER, fbo_res);
   g.glActiveTexture(GL_TEXTURE0 + 2); g.glBindTexture(GL_TEXTURE_2D, t_col);
   g.glActiveTexture(GL_TEXTURE0 + 3); g.glBindTexture(GL_TEXTURE_2D, t_ds);
-  g.glActiveTexture(GL_TEXTURE0 + 4); g.glBindTexture(GL_TEXTURE_2D, t_fog);
-  g.glUseProgram(prog_resolve); g.glDrawArrays(GL_TRIANGLES, 0, 3);
-  bound_prog = prog_resolve;
+  for (u32 ea = 0; ea < (aa ? 2u : 1u); ++ea) {
+    g.glActiveTexture(GL_TEXTURE0 + 4); g.glBindTexture(GL_TEXTURE_2D, t_fog[ea]);
+    g.glUseProgram(prog_resolve[ea]); g.glDrawArrays(GL_TRIANGLES, 0, 3);
+    bound_prog = prog_resolve[ea];
+  }
+  aa_now = false;
   g.glBindFramebuffer(GL_FRAMEBUFFER, 0);
   g.glFinish();
 }
@@ -582,6 +675,7 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
   const bool centre = true;
   const bool marking = d.mark && d.mark_on && (f.dispcnt & 0x20u) != 0u;   // edge marking this frame
   if (marking) f.flags2 |= DS_FF2_EDGEMARK;
+  d.aa_now = d.aa && (f.flags2 & DS_FF2_GAME_AA) != 0u;   // the game's bit under video.aa: this frame's edges are anti-aliased
   if (centre) f.flags2 |= DS_FF2_CENTRE;
   const bool wbuf = (f.flags & DS_FF_WBUFFER) != 0;
   // The clip z of a W-buffered frame carries wscale / w (gl_pull.glsl, ds_clip_z).
@@ -618,6 +712,7 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     for (u32 k = 0; k < npoly; ++k) if (gp[k].flags & (DS_PF_TRANSLUCENT | DS_PF_SHADOW)) want((gp[k].attr >> 24) & 0x3F);
   }
   auto code_of = [&](const GpuPoly& p) -> u32 { return code[(p.attr >> 24) & 0x3F]; };
+  auto wire_poly = [](const GpuPoly& p) { return ((p.attr >> 16) & 0x1Fu) == 0u && !(p.flags & (DS_PF_SHADOW | DS_PF_SHADOW_MASK)); };   // gl_lean.vert has the same
   d.toon_now = std::any_of(gp, gp + npoly, [](const GpuPoly& p) { return ((p.attr >> 4) & 3u) == 2u; });   // which program set draws
 
   // The opaque prefix reordered for the hardware (vk_lean.cpp): polygons
@@ -653,7 +748,7 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
 
   const double t_rec = now_ms();
   if (d.timing) a.glBeginQueryEXT(GL_TIME_ELAPSED_EXT, d.query[slot]);
-  a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_draw);
+  a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_draw[d.aa_now ? 1 : 0]);
   a.glViewport(0, 0, W, H);
   a.glDisable(GL_SCISSOR_TEST); a.glDisable(GL_CULL_FACE); a.glDisable(GL_DITHER);
   // Clear: the rear plane's colour and alpha; depth; stencil drawn where the rear plane has alpha; the fog bit; no record.
@@ -662,7 +757,7 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     if (d.indexed) { a.glColorMaski(0, 1, 1, 1, 1); a.glColorMaski(1, 1, 1, 1, 1); a.glColorMaski(2, 1, 1, 1, 1); }
     const u32 c = f.clear_color, ca = (c >> 24) & 0x1F;
     const float col[4] = {static_cast<float>(c & 0x3F) / 255.f, static_cast<float>((c >> 8) & 0x3F) / 255.f, static_cast<float>((c >> 16) & 0x3F) / 255.f, ca == 0 ? 0.f : static_cast<float>(std::min(255u, (ca + 1) * 8)) / 255.f};
-    const float fog[4] = {(f.clear_attr & 0x8000) ? 1.f : 0.f, 0.f, 0.f, 0.f};
+    const float fog[4] = {(f.clear_attr & 0x8000) ? 1.f : 0.f, 1.f, static_cast<float>((f.clear_attr >> 24) & 0x3F) / 255.f, 0.f};   // no edge; the rear plane's id
     const float cz = static_cast<float>(f.clear_depth & 0xFFFFFF);
     a.glClearBufferfv(GL_COLOR, 0, col);
     a.glClearBufferfv(GL_COLOR, 1, fog);
@@ -671,16 +766,16 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
   }
   a.glEnable(GL_STENCIL_TEST);
   u32 draws = 0;
-  auto use = [&](u32 kind, bool eq, u32 ref) { return d.use_kind(kind, wbuf, eq, ref); };
+  auto use = [&](u32 kind, bool eq, u32 ref, bool wire = false) { return d.use_kind(kind, wbuf, eq, ref, wire); };
   // A draw's vertex count is its largest polygon's fan (B7): most runs hold triangles and quads only, 6 vertices
   // an instance instead of the 24 a 10-gon needs (lean_runs.h).
   auto draw = [&](u32 kind, GLint loc, u32 first, u32 count) { if ((g_skip >> kind) & 1) return; if (loc >= 0) a.glUniform1i(loc, static_cast<GLint>(first)); a.glDrawArraysInstanced(GL_TRIANGLES, 0, static_cast<GLsizei>(fan_vertices(out_p, first, count, centre)), static_cast<GLsizei>(count)); ++draws; };
   if (first_ordered) {
     for (u32 k = 0; k < first_ordered;) {
-      const u32 c = code_of(out_p[k]); const bool early = k < n_early, eq = (out_p[k].attr & 0x4000u) != 0;
+      const u32 c = code_of(out_p[k]); const bool early = k < n_early, eq = (out_p[k].attr & 0x4000u) != 0, wire = wire_poly(out_p[k]);
       u32 j = k + 1;
-      while (j < first_ordered && code_of(out_p[j]) == c && (j < n_early) == early && ((out_p[j].attr & 0x4000u) != 0) == eq) ++j;
-      draw(early ? 0 : 1, use(early ? P_OPAQUE_EARLY : P_OPAQUE, eq, S_DRAWN | c), k, j - k);
+      while (j < first_ordered && code_of(out_p[j]) == c && (j < n_early) == early && ((out_p[j].attr & 0x4000u) != 0) == eq && wire_poly(out_p[j]) == wire) ++j;
+      draw(early ? 0 : 1, use(early ? P_OPAQUE_EARLY : P_OPAQUE, eq, S_DRAWN | c, wire), k, j - k);
       k = j;
     }
   }
@@ -691,11 +786,11 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     const GpuPoly& p = gp[i];
     const u32 mode = (p.attr >> 4) & 3, id = (p.attr >> 24) & 0x3F, c = code[id];
     const bool mask = (p.flags & DS_PF_SHADOW_MASK) != 0, shadow = (p.flags & DS_PF_SHADOW) != 0;
-    const bool trans = (p.flags & DS_PF_TRANSLUCENT) != 0, dw = (p.attr & (1u << 11)) != 0, eq = (p.attr & 0x4000u) != 0;
+    const bool trans = (p.flags & DS_PF_TRANSLUCENT) != 0, dw = (p.attr & (1u << 11)) != 0, eq = (p.attr & 0x4000u) != 0, wire = wire_poly(p);
     u32 j = i + 1;
     while (j < npoly) {
       const GpuPoly& q = gp[j];
-      if (((q.attr >> 4) & 3) != mode || ((q.attr >> 24) & 0x3F) != id || ((q.attr & 0x4000u) != 0) != eq || ((q.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT)) != (p.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT))) || ((q.attr & (1u << 11)) != 0) != dw) break;
+      if (((q.attr >> 4) & 3) != mode || ((q.attr >> 24) & 0x3F) != id || ((q.attr & 0x4000u) != 0) != eq || ((q.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT)) != (p.flags & (DS_PF_SHADOW_MASK | DS_PF_SHADOW | DS_PF_TRANSLUCENT))) || ((q.attr & (1u << 11)) != 0) != dw || wire_poly(q) != wire) break;
       ++j;
     }
     const u32 n = j - i;
@@ -708,20 +803,19 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
       draw(6, use(P_SHADOW, eq, S_T | c), i, n);
     } else if (trans) {
       u32 lo[vk::kA31Ranges], cnt[vk::kA31Ranges];   // the alpha-31 pass over the run's alpha-31 polygons alone (vk_lean.cpp)
-      if (const u32 nr = vk::alpha_31_ranges(gp, i, j, lo, cnt)) { const GLint loc = use(P_TRANS_OPQ, eq, S_DRAWN | c); for (u32 r = 0; r < nr; ++r) draw(2, loc, lo[r], cnt[r]); }
+      if (const u32 nr = vk::alpha_31_ranges(gp, i, j, lo, cnt)) { const GLint loc = use(P_TRANS_OPQ, eq, S_DRAWN | c, wire); for (u32 r = 0; r < nr; ++r) draw(2, loc, lo[r], cnt[r]); }
       const u32 npart = vk::alpha_part_ranges(gp, i, j, lo, cnt);   // the rest over the polygons that can have a pixel below 31
       if (!npart) {}
-      else if (d.fetch) { const GLint loc = use(dw ? P_TRANS_ONE_DW : P_TRANS_ONE, eq, S_DRAWN | S_T | c); for (u32 r = 0; r < npart; ++r) draw(4, loc, lo[r], cnt[r]); }   // A and B in one pass, the shader blending
+      else if (d.fetch) { const GLint loc = use(dw ? P_TRANS_ONE_DW : P_TRANS_ONE, eq, S_DRAWN | S_T | c, wire); for (u32 r = 0; r < npart; ++r) draw(4, loc, lo[r], cnt[r]); }   // A and B in one pass, the shader blending
       else {
-        if (!d.nostencil) { const GLint loc = use(dw ? P_TRANS_A_DW : P_TRANS_A, eq, S_DRAWN | S_T | c); for (u32 r = 0; r < npart; ++r) draw(3, loc, lo[r], cnt[r]); }
-        const GLint loc = use(dw ? P_TRANS_B_DW : P_TRANS_B, eq, S_DRAWN | S_T | c); for (u32 r = 0; r < npart; ++r) draw(4, loc, lo[r], cnt[r]);
+        if (!d.nostencil) { const GLint loc = use(dw ? P_TRANS_A_DW : P_TRANS_A, eq, S_DRAWN | S_T | c, wire); for (u32 r = 0; r < npart; ++r) draw(3, loc, lo[r], cnt[r]); }
+        const GLint loc = use(dw ? P_TRANS_B_DW : P_TRANS_B, eq, S_DRAWN | S_T | c, wire); for (u32 r = 0; r < npart; ++r) draw(4, loc, lo[r], cnt[r]);
       }
     } else {
-      draw(8, use(P_OPAQUE, eq, S_DRAWN | c), i, n);
+      draw(8, use(P_OPAQUE, eq, S_DRAWN | c, wire), i, n);
     }
     prev_mask = mask;
     i = j;
-    if (draws > kMaxDraws) break;
   }
   a.glDisable(GL_STENCIL_TEST); a.glDisable(GL_DEPTH_TEST); a.glDepthMask(0);
   if (d.indexed) { a.glDisablei(GL_BLEND, 0); a.glDisablei(GL_BLEND, 1); a.glColorMaski(0, 1, 1, 1, 1); a.glColorMaski(1, 1, 1, 1, 1); a.glColorMaski(2, 1, 1, 1, 1); }
@@ -743,8 +837,8 @@ bool Lean::submit(u32 npoly, u32 nvert, u32 ntexels, const GpuFrame& fin) {
     a.glBindFramebuffer(GL_FRAMEBUFFER, d.fbo_res);
     a.glActiveTexture(GL_TEXTURE0 + 2); a.glBindTexture(GL_TEXTURE_2D, d.t_col);
     a.glActiveTexture(GL_TEXTURE0 + 3); a.glBindTexture(GL_TEXTURE_2D, d.t_ds);
-    a.glActiveTexture(GL_TEXTURE0 + 4); a.glBindTexture(GL_TEXTURE_2D, d.t_fog);
-    a.glUseProgram(d.prog_resolve); d.bound_prog = d.prog_resolve;
+    a.glActiveTexture(GL_TEXTURE0 + 4); a.glBindTexture(GL_TEXTURE_2D, d.t_fog[d.aa_now ? 1 : 0]);
+    a.glUseProgram(d.prog_resolve[d.aa_now ? 1 : 0]); d.bound_prog = d.prog_resolve[d.aa_now ? 1 : 0];
     if (!((g_skip >> 9) & 1)) { a.glDrawArrays(GL_TRIANGLES, 0, 3); ++draws; }
   }
   if (marking) {   // the record's edge pixels recoloured (gl_mark.frag); the framebuffer stays bound for the read below

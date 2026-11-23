@@ -5,6 +5,8 @@
 // frames, optionally tracing instructions or dumping frames/audio.
 #include "core/gpu/colour.h"
 #include "core/nds.h"
+#include "core/safe_file.h"
+#include "frontend/camera_image.h"
 #include "core/cpu/timing_mode.h"
 #include "core/pc_sampler.h"
 #include "core/mem/fastmem_census.h"
@@ -37,11 +39,14 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <sys/stat.h>   // output_path_safe; not only with the network code below
 #include <thread>
 #if DSPERATE_NET
 #include "net/lan_mp.h"
 #include "net/slirp_driver.h"
 #include <arpa/inet.h>
+#include <strings.h>
+#include <sys/stat.h>
 #endif
 
 namespace {
@@ -175,6 +180,31 @@ void swi_log_cb(ds::CpuContext& cpu, ds::u32 instr, void* user) {
   }
 }
 
+// False (with the reason on stderr) when writing `path` would destroy something: it is one of the run's input
+// files, or it exists and is named as a ROM, an archive or a battery save.
+bool output_path_safe(const char* opt, const char* path, const char* const* inputs, size_t n_inputs) {
+  struct stat out;
+  if (stat(path, &out) != 0) return true;   // a new file
+  if (!S_ISREG(out.st_mode)) return true;   // /dev/null, a pipe
+  for (size_t k = 0; k < n_inputs; ++k) {
+    struct stat in;
+    if (inputs[k] && stat(inputs[k], &in) == 0 && in.st_dev == out.st_dev && in.st_ino == out.st_ino) {
+      std::fprintf(stderr, "%s %s: that file is an input of this run; not overwriting it\n", opt, path);
+      return false;
+    }
+  }
+  static const char* const kept[] = {".nds", ".dsi", ".srl", ".ids", ".gba", ".zip", ".7z", ".sav", ".dsv", ".cia", ".dsin"};
+  const size_t len = std::strlen(path);
+  for (const char* e : kept) {
+    const size_t el = std::strlen(e);
+    if (len >= el && !strcasecmp(path + len - el, e)) {
+      std::fprintf(stderr, "%s %s: an existing %s file; not overwriting it\n", opt, path, e);
+      return false;
+    }
+  }
+  return true;
+}
+
 void write_blob(const std::string& path, const ds::u8* p, size_t n) {
   if (FILE* f = std::fopen(path.c_str(), "wb")) { std::fwrite(p, 1, n, f); std::fclose(f); }
 }
@@ -242,7 +272,7 @@ int main(int argc, char** argv) {
   int scaled_n = 0; const char* scaled_path = nullptr;
   const char *rom = nullptr, *bios9 = nullptr, *bios7 = nullptr, *fw = nullptr, *trace = nullptr, *dump = nullptr, *hash_frames = nullptr, *dump_audio = nullptr, *replay = nullptr, *save = nullptr;
   const char* load_state = nullptr; const char* save_state_path = nullptr; int save_state_at = -1;
-  const char *gba_rom = nullptr, *gba_save = nullptr, *gba_save_out = nullptr; int gba_light = 5; bool rumble_pak = false, guitar_grip = false;
+  const char *gba_rom = nullptr, *gba_save = nullptr, *gba_save_out = nullptr, *save_out = nullptr; int gba_light = 5; bool rumble_pak = false, guitar_grip = false; const char* motion_pak = nullptr; ds::slot2::Motion motion; const char* camera_image = nullptr; bool timing_given = false;
   const char* hide_screen = nullptr;
   int frameskip = 0;    // --frameskip N: skip drawing N of every N+1 frames (fixed; the SDL frontend also has the adaptive mode)
   bool frameskip_capture = false;
@@ -290,7 +320,17 @@ int main(int argc, char** argv) {
   std::vector<Touch> touches;          // --touch F:x,y[:N]: press (x,y) from frame F for N frames (default 10)
   bool pace = false;                   // --pace: sleep to 60 frames a second
   for (int i = 1; i < argc; ++i) {
-    auto arg = [&](const char* name) { return !std::strcmp(argv[i], name) && i + 1 < argc; };
+    // An option that takes values must be followed by them: a missing one is an error, never the next
+    // argument (which was the ROM, and an output option then wrote over it).
+    auto arg = [&](const char* name, int n = 1) {
+      if (std::strcmp(argv[i], name)) return false;
+      for (int k = 1; k <= n; ++k)
+        if (i + k >= argc || !argv[i + k][0] || !std::strncmp(argv[i + k], "--", 2)) {
+          std::fprintf(stderr, "%s needs %s\n", name, n > 1 ? "its values" : "a value");
+          std::exit(2);
+        }
+      return true;
+    };
     auto flag = [&](const char* name) { return !std::strcmp(argv[i], name); };
     if (arg("--frames")) { frames = std::atoi(argv[++i]); frames_given = true; }
     else if (arg("--lan-host")) { lan_host = argv[++i]; pace = true; }
@@ -341,16 +381,22 @@ int main(int argc, char** argv) {
       if (!std::getenv("DS_GPU_NOLAG")) setenv("DS_GPU_NOLAG", "1", 1);   // each frame's own record, not the lag rule's
     }
     else if (arg("--dump-3d-fine")) { fine3d_path = argv[++i]; setenv("DS_LEAN_FINE", "1", 1); }   // FILE: with --gpu3d --gpu3d-scale N, the GPU raster's record at its own scale (256N x 192N words a frame; a frame without one is written as zeros)
-    else if (arg("--dump-gpu-frame")) { gpu_dump_frame = std::atol(argv[++i]); gpu_dump_path = argv[++i]; }   // N FILE: frame N's polygon list in the GPU raster's layout (vk_dump.h)
+    else if (arg("--dump-gpu-frame", 2)) { gpu_dump_frame = std::atol(argv[++i]); gpu_dump_path = argv[++i]; }   // N FILE: frame N's polygon list in the GPU raster's layout (vk_dump.h)
 
     else if (arg("--hash-frames")) hash_frames = argv[++i];   // FILE: "frame top bottom" per frame, FNV-1a 64 of each screen's 0xAARRGGBB (the video golden hashes)
-    else if (arg("--dump-scaled")) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
+    else if (arg("--dump-scaled", 2)) { scaled_n = std::atoi(argv[++i]); scaled_path = argv[++i]; }   // N FILE: both screens through the scanline scaler at Nx, raw BGRA
     else if (arg("--dump-from")) dump_from = std::atoi(argv[++i]);    // first frame to dump
     else if (arg("--dump-count")) dump_count = std::atoi(argv[++i]);  // how many (0 = to the end)
     else if (arg("--dump-at")) { for (const char* p = argv[++i]; *p;) { char* e; dump_at.push_back(static_cast<int>(std::strtol(p, &e, 10))); p = *e ? e + 1 : e; } }   // F1,F2,..: every dump takes these frames only
     else if (arg("--dump-audio")) dump_audio = argv[++i];   // raw s16 stereo, 32768 Hz
     else if (arg("--replay")) replay = argv[++i];           // inputs recorded by dsperate-sdl --record; sets --frames to its length unless given
     else if (arg("--save")) save = argv[++i];               // battery save to start from; loaded read-only, never written back
+    else if (arg("--save-out")) save_out = argv[++i];       // at exit, the battery save as the run left it (for checking what a game wrote)
+    else if (arg("--dsi-camera-image")) camera_image = argv[++i];   // the picture the DSi cameras see (JPEG, PNG, BMP); default colour bars
+    else if (arg("--motion-pak")) motion_pak = argv[++i];   // retail | homebrew: the motion accessory in slot 2, held still (see --motion)
+    else if (arg("--motion")) {                              // AX,AY,AZ[,GZ]: what it feels, m/s^2 and rad/s (default 0,0,9.80665: lying flat)
+      if (std::sscanf(argv[++i], "%f,%f,%f,%f", &motion.ax, &motion.ay, &motion.az, &motion.gz) < 3) { std::fprintf(stderr, "--motion wants AX,AY,AZ[,GZ]\n"); return 2; }
+    }
     else if (arg("--gba-rom")) gba_rom = argv[++i];         // a GBA game in slot 2 (DS mode only)
     else if (arg("--gba-save")) gba_save = argv[++i];       // its save, read-only like --save; default none
     else if (arg("--gba-save-out")) gba_save_out = argv[++i];   // at exit, the GBA save as the run left it (for checking what a game wrote)
@@ -363,7 +409,7 @@ int main(int argc, char** argv) {
     else if (arg("--cheat")) enable_cheats.push_back(argv[++i]);   // enable one by name, or by "#N" from --list-cheats
     else if (!std::strcmp(argv[i], "--direct")) direct = true;
     else if (!std::strcmp(argv[i], "--interp")) jit = false;
-    else if (arg("--timing")) { const char* m = argv[++i]; if (!std::getenv("DS_TIMING")) ds::g_fast_timing = std::strcmp(m, "exact") != 0; }   // CPU cycle model (timing_mode.h): fast (default) | exact; DS_TIMING wins
+    else if (arg("--timing")) { const char* m = argv[++i]; timing_given = true; if (!std::getenv("DS_TIMING") && !ds::set_timing(m)) { std::fprintf(stderr, "--timing: exact, fast or turbo\n"); return 2; } }   // CPU cycle model (timing_mode.h): fast (default) | exact | turbo; DS_TIMING wins
 
     else if (flag("--rtc-host")) rtc_host = true;                            // INEXACT by construction: runs stop being reproducible
     else if (arg("--firmware-override")) fw_override = argv[++i];            // load it, and write back what the firmware changed
@@ -381,7 +427,21 @@ int main(int argc, char** argv) {
     else if (arg("--stats-from")) stats_from = std::atoi(argv[++i]);
     else if (arg("--pc-profile")) pc_profile = argv[++i];                   // a sampling profile of every thread from --stats-from on
     else if (arg("--save-state-at")) { save_state_at = std::atoi(argv[++i]); save_state_path = std::strchr(argv[i], ':'); if (save_state_path) ++save_state_path; }   // N:path -- write after N frames (0 = at once)
+    else if (!std::strncmp(argv[i], "--", 2)) { std::fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
+    else if (rom) { std::fprintf(stderr, "two ROMs given: %s and %s\n", rom, argv[i]); return 2; }
     else rom = argv[i];
+  }
+  // No output may land on a file the run reads, or on an existing ROM, archive or save.
+  {
+    const char* const ins[] = {rom, bios9, bios7, fw, bios9i, bios7i, dsi_boot, dsi_nand, dsi_install, dsi_tmd, dsi_font,
+                               replay, save, gba_rom, gba_save, cheat_db, analog_db, load_state, camera_image};
+    const std::pair<const char*, const char*> outs[] = {
+        {"--dump-frames", dump}, {"--dump-3d", rec3d_path}, {"--dump-3d-fine", fine3d_path},
+        {"--dump-screens-scaled", screens_scaled_path}, {"--dump-gpu-frame", gpu_dump_path}, {"--hash-frames", hash_frames},
+        {"--dump-scaled", scaled_path}, {"--dump-audio", dump_audio}, {"--gba-save-out", gba_save_out}, {"--save-out", save_out},
+        {"--pc-profile", pc_profile}, {"--save-state-at", save_state_path}};
+    for (const auto& [opt, path] : outs)
+      if (path && !output_path_safe(opt, path, ins, sizeof ins / sizeof ins[0])) return 2;
   }
   // Without --direct, replay inputs land in the firmware setup wizard instead.
   if (replay && !direct)
@@ -524,6 +584,8 @@ int main(int argc, char** argv) {
     if (want && !nds.bios_native_dsi) { std::fprintf(stderr, "DSi mode needs --bios9i/--bios7i\n"); return 1; }
     if (want && !capable) std::fprintf(stderr, "warning: --dsi with a DS-only header (unit code %02x)\n", nds.cart ? nds.cart->header().unit_code : 0);
     if (want) {
+      // A DSi runs on the exact timing model unless --timing or DS_TIMING says otherwise (see the SDL frontend).
+      if (!timing_given && !std::getenv("DS_TIMING")) ds::set_timing("exact");
       nds.set_dsi(true);
       nds.dsi_nand_boot = dsi_nand_boot;
       if (dsi_hle && rom && !nds.dsi_nand_boot) {
@@ -649,11 +711,24 @@ int main(int argc, char** argv) {
     nds.dsi_autoload(lo, hi);
     std::fprintf(stderr, "dsi: autoload %08x%08x (TLNC)\n", hi, lo);
   }
-  if (gba_rom || rumble_pak || guitar_grip) {
-    if ((gba_rom != nullptr) + rumble_pak + guitar_grip > 1) { std::fprintf(stderr, "--gba-rom, --rumble-pak and --guitar-grip each want slot 2\n"); return 2; }
+  if (camera_image) {
+    std::string err;
+    if (!ds::frontend::set_camera_image(nds, camera_image, err)) { std::fprintf(stderr, "camera: %s\n", err.c_str()); return 2; }
+    std::fprintf(stderr, "camera: looking at %s\n", camera_image);
+  }
+  if (motion_pak && std::strcmp(motion_pak, "retail") && std::strcmp(motion_pak, "homebrew")) { std::fprintf(stderr, "--motion-pak wants retail or homebrew\n"); return 2; }
+  if (gba_rom || rumble_pak || guitar_grip || motion_pak) {
+    if ((gba_rom != nullptr) + rumble_pak + guitar_grip + (motion_pak != nullptr) > 1) { std::fprintf(stderr, "--gba-rom, --rumble-pak, --guitar-grip and --motion-pak each want slot 2\n"); return 2; }
     if (nds.dsi) std::fprintf(stderr, "slot2: a DSi has no slot 2; ignored\n");
     else if (rumble_pak) { nds.slot2 = std::make_unique<ds::slot2::RumblePak>(); std::fprintf(stderr, "slot2: Rumble Pak\n"); }
     else if (guitar_grip) { nds.slot2 = std::make_unique<ds::slot2::GuitarGrip>(); std::fprintf(stderr, "slot2: Guitar Grip\n"); }
+    else if (motion_pak) {
+      const bool retail = !std::strcmp(motion_pak, "retail");
+      auto pak = std::make_unique<ds::slot2::MotionPak>(retail ? ds::slot2::MotionPak::Model::Retail : ds::slot2::MotionPak::Model::Homebrew);
+      pak->set_motion(motion);
+      nds.slot2 = std::move(pak);
+      std::fprintf(stderr, "slot2: %s, feeling %.2f %.2f %.2f m/s2, %.2f rad/s\n", retail ? "DS Motion Pack" : "DS Motion Card", motion.ax, motion.ay, motion.az, motion.gz);
+    }
     else {
       std::string err;
       std::unique_ptr<ds::slot2::GameCart> g = ds::slot2::load_game(gba_rom, gba_save ? gba_save : "", err);
@@ -887,6 +962,9 @@ int main(int argc, char** argv) {
     } else
 #endif
     nds.run_frame();
+    // DS_HAND_FRAME=1 (a check): every frame handed as a frontend with a present thread takes it (Gpu::hand_frame);
+    // =2: every other frame. The picture and every hash must be what they are without it.
+    if (static const int hand = std::getenv("DS_HAND_FRAME") ? std::atoi(std::getenv("DS_HAND_FRAME")) : 0; hand == 1 || (hand == 2 && (nds.frame_count & 1)) || (hand == 3 && nds.frame_count % 3 == 0)) nds.gpu.hand_frame();
     if (screens_scaled_out && dump_frame(i)) {
       const ds::u32 n = static_cast<ds::u32>(std::max(1, gpu3d_scale));
       screens_scaled_px.resize(static_cast<size_t>(ds::SCREEN_W) * n * ds::SCREEN_H * n);
@@ -1052,6 +1130,13 @@ int main(int argc, char** argv) {
     std::string err;
     if (ds::slot2::write_save(*g, gba_save_out, err)) std::fprintf(stderr, "slot2: wrote the GBA save to %s\n", gba_save_out);
     else std::fprintf(stderr, "slot2: %s\n", err.c_str());
+  }
+  if (nds.dsi_dsp_started) std::fprintf(stderr, "dsp: the title started the DSP\n");
+  if (nds.cart && save_out) {
+    std::string err;
+    std::fprintf(stderr, "save: %u chip writes\n", nds.cart->sram_writes());
+    if (ds::write_file_atomic(save_out, nds.cart->sram().data(), nds.cart->sram().size(), err)) std::fprintf(stderr, "save: wrote %s\n", save_out);
+    else std::fprintf(stderr, "save: %s\n", err.c_str());
   }
   std::fprintf(stderr, "ran %llu frames, %llu cycles\n",
               static_cast<unsigned long long>(nds.frame_count),

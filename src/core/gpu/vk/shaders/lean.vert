@@ -12,6 +12,8 @@
 // attributes read from whole-pixel planes, a polygon inside one pixel row or
 // column redrawn as a line, vertices on whole pixels, and the DS's fill itself
 // from a table of rows (exact, and at 1x the dearer).
+// The one exception is a sprite at 1x (DS_PF_SPRITE, vk_layout.h; below): there the DS's whole-pixel vertices
+// decide which texel row is dropped, and DeSmuME's renderer drops the wrong one as this did.
 #extension GL_GOOGLE_include_directive : require
 #define DS_GLSL 1
 #include "vk_layout.h"
@@ -96,6 +98,16 @@ void main() {
     // sprite between the fan's seams (SM64's file select, the arrow).
     ta.z = int(floor((wb ? zs * cw : zs / n) + 0.5));
   }
+  // A sprite at 1x (DS_PF_SPRITE, vk_layout.h): its vertices on whole pixels, and the texture read half a pixel
+  // up and left, at the pixel's corner (a 128th short of it, so a coordinate on a texel's edge stays in the texel).
+  vec2 st_off = vec2(0.0);
+  if ((p.flags & DS_PF_SPRITE) != 0u && pc.f.scale <= 1u) {
+    GpuVert q0 = verts[p.first_vert], q1 = verts[p.first_vert + 1u], q2 = verts[p.first_vert + 2u];
+    float l1 = float((q1.sx - q0.sx) + (q1.sy - q0.sy)), l2 = float((q2.sx - q1.sx) + (q2.sy - q1.sy));
+    st_off = (0.5 - 1.0 / 128.0) * (vec2(float(q1.s - q0.s), float(q1.t - q0.t)) / l1 + vec2(float(q2.s - q1.s), float(q2.t - q1.t)) / l2);
+    if (cfan) { ta.fx = (q0.sx + q2.sx) * 8; ta.fy = (q0.sy + q2.sy) * 8; } else { ta.fx = ta.sx * 16; ta.fy = ta.sy * 16; }
+    tb.fx = tb.sx * 16; tb.fy = tb.sy * 16; tc.fx = tc.sx * 16; tc.fy = tc.sy * 16;
+  }
   GpuVert vt = ta; if (k == 1u) vt = tb; else if (k == 2u) vt = tc;
   float w = max(float(vt.w), 1.0);
   // The vertex on its 28.4 position: an edge at x covers [x, x1) exactly, whatever the sample pattern.
@@ -130,9 +142,14 @@ void main() {
     // Over the coordinate's change across one DS pixel (along x or y, whichever is more): under 1, an edge pixel. One
     // value a triangle, so the quotient interpolates as the coordinate does and the fragment stage needs no second varying.
     v_edge /= max(vec3(max(sa.x, sa.y), max(sb.x, sb.y), max(sc2.x, sc2.y)) / den, vec3(1e-9));
+    // The test is there for a texture that cuts texels out (the hole's rim is not the polygon's edge). It goes by
+    // the fan's triangle, and a polygon seen nearly edge-on has silhouette pixels in a triangle that does not own
+    // the outline side: two and three pixels "inside", and the outline had gaps (the left of every sphere in
+    // BlocksDS's edge-marking example). A polygon whose texture cuts nothing out: every pixel may be marked.
+    if ((p.flags & DS_PF_TEX_ALPHA) == 0u) v_edge = vec3(0.0);
   }
   v_rgb = vec3(float(vt.r), float(vt.g), float(vt.b));
-  v_st = vec2(float(vt.s), float(vt.t));
+  v_st = vec2(float(vt.s), float(vt.t)) - st_off;
   v_z = z;
   v_zp = z;
 }

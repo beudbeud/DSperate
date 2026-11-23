@@ -56,7 +56,9 @@ public:
   // frame is copied out, so `fb` may change straight after. The others draw
   // here, as draw() does. Every other call on a window waits for its present
   // first, so none of them sees one half done.
-  static void draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const Merge3D* merge = nullptr);
+  // `held`: per screen, fb[s] (and the merge's words for it) stay as they are until the draw_async after next
+  // (the core's handed frame, Gpu::hand_frame): shown from where they are instead of from a copy.
+  static void draw_async(Display* const ds[], int n, const u32* const fb[SCREENS], const Merge3D* merge = nullptr, const bool* held = nullptr);
 
   // Per-scanline scaling: the core scales each line into place as it's
   // produced, straight into the window surface or a scanout tier's buffer
@@ -144,7 +146,7 @@ public:
   // or draws cells before the merge.
   bool merge3d_ok() const;
   // What keeps the window from merging it, for the menu's GPU 3D SCALE row.
-  enum class MergeBlock : u8 { None, NoVulkanPresent, Bilinear, Colour, ChunkySource, SeamBlend };
+  enum class MergeBlock : u8 { None, NoVulkanPresent, ChunkySource };
   MergeBlock merge3d_block() const;
   // Where `screen` shows in this window, in the canvas's coordinates; false if it does not.
   bool screen_rect(int screen, frontend::Rect& out) const {
@@ -296,6 +298,11 @@ private:
   int               disp_divisor_ = 1;   // the divisor build_source_scale chose, restored after a page
   bool              page_ = false;
   std::unique_ptr<ScanoutOut> out_;     // tier 1; null on the surface tier
+public:
+  // What reached the panel, as the scanout tier is told (ScanoutOut::shown).
+  ScanoutOut::Shown shown() const { return out_ ? out_->panel_shown() : ScanoutOut::Shown{}; }
+  void shown_reset() { if (out_) out_->panel_shown_reset(); }
+private:
   bool              gpu_wanted_ = false;
   std::unique_ptr<FramePresenter> gpu_; // a GPU presenter (on top of out_ for the import one); null: software
   bool try_gpu_present();               // after out_ opened: import its buffers, switch draw() over

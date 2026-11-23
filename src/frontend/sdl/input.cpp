@@ -177,10 +177,20 @@ Input::AnalogMode Input::analog_mode() const {
 }
 
 bool Input::analog_claims(StylusAxis s) const {
+  if (s != StylusAxis::None && s == motion_stick_) return true;
   if (!analog_patch_ || s == StylusAxis::None) return false;
   const AnalogMode m = analog_mode();
   if (m == AnalogMode::Dual) return true;
   return s == (m == AnalogMode::Left ? StylusAxis::Left : m == AnalogMode::Right ? StylusAxis::Right : StylusAxis::None);
+}
+
+void Input::set_motion_stick(const std::string& which) {
+  const StylusAxis s = which == "left" ? StylusAxis::Left : which == "right" ? StylusAxis::Right : StylusAxis::None;
+  if (s == motion_stick_) return;
+  motion_stick_ = s;
+  // As set_analog_patch: directions the claimed stick was holding would otherwise stay held.
+  if (analog_claims(stick_dpad_)) { stick_ = 0; stick_prev_ = 0; dstick_x_ = dstick_y_ = 0; }
+  if (analog_claims(stick_face_)) face_stick_ = 0;
 }
 
 void Input::set_analog_patch(bool on) {
@@ -420,6 +430,39 @@ void Input::detect_faces() {
   for (int f = 0; f < 4; ++f) face_remap_[f] = static_cast<u8>(phys[f]);
   std::fprintf(stderr, "controller: SDL mapping has %s swapped against the kernel's button positions; correcting (pad.face_fix = off to keep it)\n",
                phys[0] != 0 && phys[2] != 2 ? "a/b and x/y" : phys[0] != 0 ? "a/b" : "x/y");
+}
+
+// SDL's sensors arrived in 2.0.14; an older library has none to offer.
+bool Input::pad_has_motion() const {
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+  return pad_ && SDL_GameControllerHasSensor(pad_, SDL_SENSOR_ACCEL) == SDL_TRUE;
+#else
+  return false;
+#endif
+}
+
+bool Input::pad_motion(slot2::Motion& m, const float* r) {
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+  if (!pad_has_motion()) return false;
+  if (!SDL_GameControllerIsSensorEnabled(pad_, SDL_SENSOR_ACCEL)) {
+    SDL_GameControllerSetSensorEnabled(pad_, SDL_SENSOR_ACCEL, SDL_TRUE);
+    if (SDL_GameControllerHasSensor(pad_, SDL_SENSOR_GYRO)) SDL_GameControllerSetSensorEnabled(pad_, SDL_SENSOR_GYRO, SDL_TRUE);
+  }
+  float a[3];
+  if (SDL_GameControllerGetSensorData(pad_, SDL_SENSOR_ACCEL, a, 3) != 0) return false;
+  // SDL's frame as is: right for a handheld. Other ways of holding a
+  // controller are slot2.motion_matrix's to correct.
+  m.ax = r[0] * a[0] + r[1] * a[1] + r[2] * a[2];
+  m.ay = r[3] * a[0] + r[4] * a[1] + r[5] * a[2];
+  m.az = r[6] * a[0] + r[7] * a[1] + r[8] * a[2];
+  float g[3];
+  m.gz = SDL_GameControllerIsSensorEnabled(pad_, SDL_SENSOR_GYRO) && SDL_GameControllerGetSensorData(pad_, SDL_SENSOR_GYRO, g, 3) == 0
+             ? r[6] * g[0] + r[7] * g[1] + r[8] * g[2]
+             : 0;
+  return true;
+#else
+  (void)m; (void)r; return false;
+#endif
 }
 
 bool Input::has_rumble() const {

@@ -6,6 +6,7 @@
 // Guest r0-r3/sp are pinned in r4-r8; others go through an LRU RegCache (host
 // r0-r3/r12), written back before anything can observe memory. Guest NZCVQ lives
 // in host APSR; conditionals are predicated. Rare ops go to the fallback stub.
+#include "core/cpu/block_xfer.h"
 #include "core/cpu/jit/jit_internal.h"
 #include "core/cpu/jit/a32/convention.h"
 #include "core/cpu/jit/a32/emit.h"
@@ -148,11 +149,14 @@ FlagUse arm_flag_use(u32 instr, bool a9) {
   case AOp::Mrs: u.reads = F_ALL; break;
   case AOp::MsrReg: case AOp::MsrImm:
     u.reads = F_ALL;                                   // mode-change path syncs CPSR via the interpreter
-    if (instr & (1u << 19)) u.writes = F_ALL;          // f field
+    if ((instr & (1u << 19)) && !(instr & (1u << 22))) u.writes = F_ALL;   // f field of the CPSR; MSR SPSR must not claim the flags
     break;
   case AOp::B: case AOp::Bl: case AOp::Bx: case AOp::BlxReg: case AOp::Clz: case AOp::Pld: case AOp::Mcr:
   case AOp::SmlaXY: case AOp::SmulXY: case AOp::SmlawY: case AOp::SmulwY:
-  case AOp::LdrStrImm: case AOp::LdrStrReg: case AOp::LdrStrHImm: case AOp::LdrStrHReg: case AOp::Ldm: case AOp::Stm:
+  case AOp::LdrStrReg:
+    if (((instr >> 4) & 0xFF) == 0x06) u.reads |= F_C;   // an RRX offset shifts the carry in
+    break;
+  case AOp::LdrStrImm: case AOp::LdrStrHImm: case AOp::LdrStrHReg: case AOp::Ldm: case AOp::Stm:
     break;
   default: u = {F_ALL, F_ALL}; break;
   }
@@ -714,6 +718,10 @@ private:
     cache_.restore(s0);
     cache_.writeback();
     emit_slow_args(a, load ? 0xFF : data);
+    if (load && !a9_) {   // the ARM7's BIOS answers a read by where it comes from (Bus::io_read): cold code only
+      e().mov_imm(SCRATCH3, pc_ + (thumb_ ? 4 : 8));
+      e().str(SCRATCH3, R_CTX, off_reg(15));
+    }
     call_stub(load ? rt().slow_load[size_index(m)] : rt().slow_store[size_index(m)]);
     if (load) {
       emit_load_post(m, 0, 1, 2);
@@ -779,7 +787,7 @@ private:
         cache_.unlock(h);
         ++k;
       }
-      if (writeback && !(list & (1u << rn))) {         // a loaded rn wins over the writeback
+      if (writeback && cpu::ldm_writeback_wins(a9_, thumb_, list, rn)) {   // on the ARM7 a loaded rn wins over the writeback
         const u32 h = cache_.write(rn, false);
         e().mov(h, wv);
         cache_.unlock(h);
@@ -790,7 +798,7 @@ private:
         u32 src;
         bool tmp = false;
         if (i == 15) { src = cache_.temp(); e().mov_imm(src, pc_store_value); tmp = true; }
-        else if (i == rn && !first && writeback) src = wv;
+        else if (i == rn && writeback && cpu::stm_stores_new_base(a9_, first)) src = wv;
         else src = cache_.read(i);
         e().str(src, en, 4 * k);
         if (tmp) cache_.release(src); else if (src != a && src != t_w) cache_.unlock(src);
@@ -934,7 +942,14 @@ private:
   void emit_branch_indirect(u32 htarget, bool interwork, bool cdi = false, u32 hnumd = 0, u32 haddr = 0) {
     assert(cond_ == AL);
     cache_.flush();                                 // temps keep their values
-    flush_pending();
+    // The charge here, not through flush_pending: the flush above unlocked every slot, so a
+    // charge that is no immediate would take its temp from the slot holding the target.
+    if (pending_) {
+      u32 i;
+      if (encode_imm12(pending_, i)) e().dp_imm(SUB, false, R_BUDGET, R_BUDGET, i);
+      else { e().mov_imm(R_LR, pending_); e().sub_reg(R_BUDGET, R_BUDGET, R_LR); }
+      pending_ = 0;
+    }
     if (cdi) { const u32 d[3] = {0, 1, 2}, sr[3] = {htarget, hnumd, haddr}; emit_permute(d, sr, 3); }
     else if (htarget != SCRATCH0) e().mov(SCRATCH0, htarget);
     if (!interwork) {
@@ -1013,6 +1028,34 @@ void Translator::arm_msr(u32 instr, AOp op) {
   u32 wv;
   if (op == AOp::MsrImm) { wv = cache_.temp(); e().mov_imm(wv, rotr(instr & 0xFF, ((instr >> 8) & 0xF) * 2)); }
   else wv = cache_.read(instr & 0xF);
+  // MSR SPSR: one word of the context, no flags, no mode or bank change; skipped in USR/SYS, which have none.
+  if (instr & (1u << 22)) {
+    const u32 smask = ((fields & 1) ? 0x000000FFu : 0) | ((fields & 2) ? 0x0000FF00u : 0)
+                    | ((fields & 4) ? 0x00FF0000u : 0) | ((fields & 8) ? 0xFF000000u : 0);
+    add_pending(numC(pc_));
+    flush_pending();
+    if (!smask) return;
+    const u32 t2 = cache_.temp(), t3 = cache_.temp(), f = cache_.temp();
+    e().mrs_apsr(f);                              // the mode test below uses the host flags, which hold the guest's
+    e().ldr(t2, R_CTX, OFF_CPSR);
+    e().ubfx(t3, t2, 0, 5);
+    e().cmp_imm(t3, 0x10);
+    e().cmp_imm(t3, 0x1F, NE);
+    const size_t skip = e().b_fwd(EQ);
+    if (smask == 0xFFFFFFFFu) e().str(wv, R_CTX, OFF_SPSR);
+    else {
+      e().ldr(t2, R_CTX, OFF_SPSR);
+      e().mov_imm(t3, smask);
+      e().dp_reg(BIC, false, t2, t2, t3);
+      e().and_reg(t3, wv, t3);
+      e().orr_reg(t2, t2, t3);
+      e().str(t2, R_CTX, OFF_SPSR);
+    }
+    e().bind(skip);
+    e().msr_apsr_nzcvq(f);
+    cache_.release(t2); cache_.release(t3); cache_.release(f);
+    return;
+  }
   const u32 mem_mask = ((fields & 1) ? 0xC0u : 0) | ((fields & 2) ? 0xFF00u : 0) | ((fields & 4) ? 0xFF0000u : 0) | ((fields & 8) ? 0x0F000000u : 0);
   const bool tests = (fields & 7) != 0;
   std::vector<size_t> fail;
@@ -1046,6 +1089,7 @@ void Translator::arm_msr(u32 instr, AOp op) {
   }
   if (fields & 8) e().msr_apsr_nzcvq(wv);
   if (fields & 1) { call_stub(rt().poll); e().word(make_key(pc_ + 4, thumb_)); }   // I may have changed
+  cache_.release(wv);   // the poll uses r0, r1 and r3: a cached source register is not in its slot any more (a pinned one is not a slot)
   cache_.release(t2); cache_.release(t3);
   if (f != 0xFF) cache_.release(f);
   if (fail.empty()) return;
@@ -1111,7 +1155,7 @@ void Translator::arm_ldm_stm(u32 instr, bool load) {
   else   { if (p) e().sub_imm(a, hb, n * 4, a); else e().sub_imm(a, hb, n * 4 - 4, a); }
   e().and_imm(a, a, ~3u);
   u32 t_w = 0xFF;
-  if (w && !(!u && p)) {                               // db!: writeback = start address, no t_w
+  if (w) {                                             // its own register: `a` is word-aligned below, the writeback is not
     t_w = cache_.temp();
     if (u) e().add_imm(t_w, hb, n * 4, t_w); else e().sub_imm(t_w, hb, n * 4, t_w);
   }
@@ -1653,13 +1697,13 @@ bool Translator::run() {
     const bool ends = thumb_ ? shape::thumb_ends_block(static_cast<u16>(raw)) : shape::arm_ends_block(raw, a9_);
     addr += step();
     if (ends) break;
-    if (!cpu_.page_table.read_ptr(addr)) break;
+    if (!cpu_.page_table.read_ptr(addr) && !cpu_.nds->bus.bios7_code(cpu_.which, addr)) break;
   }
 
   // Backward flag liveness.
   u32 live = F_ALL;
   for (size_t i = instrs_.size(); i-- > 0;) {
-    instrs_[i].live_out = live;
+    instrs_[i].live_out = rt().trace ? F_ALL : live;   // a traced run prints the CPSR at every instruction: no flag is dead to it
     const bool paired = thumb_ && i > 0 && arm::decode_thumb(static_cast<u16>(instrs_[i - 1].raw)) == TOp::BlPrefix;
     const FlagUse u = instrs_[i].fallback ? FlagUse{F_ALL, 0}
                     : thumb_ ? thumb_flag_use(static_cast<u16>(instrs_[i].raw), a9_, paired) : arm_flag_use(instrs_[i].raw, a9_);

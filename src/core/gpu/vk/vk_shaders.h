@@ -14,6 +14,7 @@ struct Spirv {
   size_t     bytes = 0;      // vkCreateShaderModule wants a byte count
 };
 
+Spirv shader_lean_null();    // a fragment stage with no output (lean_null.frag)
 Spirv shader_tri_fs();       // a fullscreen triangle (the resolve subpass)
 Spirv shader_lean_vert();    // lean path (vk_lean.cpp): each polygon a fan
 Spirv shader_lean_frag();    // ... its one fragment stage
@@ -25,6 +26,7 @@ Spirv shader_lean_resolve(); // ... and the resolve into the 3D layer record
 Spirv shader_lean_resolve_1x();   // ... the same over single-sample attachments (aa off)
 Spirv shader_lean_mark();         // ... edge marking over the finished record (lean_mark.frag)
 Spirv shader_lean_down();         // ... the 1x record of a frame drawn above 1x (lean_down.frag)
+Spirv shader_lean_crack();        // ... the record of any other frame from its scratch image, cracks filled (lean_crack.frag)
 Spirv shader_lean_msdec();        // ... the record of a multisampled frame from the hardware's resolve (lean_msdec.frag)
 Spirv shader_lean_fog();          // ... the fog as the draw subpass's last draw (the direct output)
 

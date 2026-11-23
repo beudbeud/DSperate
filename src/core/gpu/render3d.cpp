@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // DSperate - Nintendo DS emulator. Copyright (C) 2026 DSperate contributors.
+#include "core/gpu/gpu_timeline.h"
 #include "core/gpu/render3d.h"
 #include "core/gpu/vk/vk_dump.h"
 #include "core/gpu/gpu_raster.h"
@@ -383,14 +384,31 @@ void Renderer3D::gpu_job_start() {
     place_current_thread(ThreadRole::Band, 1);   // a band core: the band workers idle while the GPU draws
     std::unique_lock<std::mutex> lk(j->m);
     for (;;) {
-      j->cv.wait(lk, [j] { return j->pending || j->quit; });
+      j->cv.wait(lk, [j] { return j->pending || j->list || j->quit; });
       if (j->quit) return;
+      if (j->list) {   // a list alone, ahead of its frame's submit
+        Gpu3D* const gx = j->list_gx; const u32 lbank = j->list_bank;
+        j->list = false; j->list_busy = true;
+        lk.unlock();
+        pre_serial_ = 0;
+        const u64 serial = gx->stream_serial(lbank);
+        pre_n_ = gx->stream_list(lbank, job_polys_); pre_bank_ = lbank; pre_serial_ = serial;
+        lk.lock();
+        j->list_busy = false;
+        j->cv.notify_all();
+        continue;
+      }
       const u32 np = j->np, nv = j->nv, ntex = j->ntex; const vk::GpuFrame f = j->f;
       const bool cpu = j->cpu; const u32 bank = j->bank; const u64 jframe = j->frame;
       lk.unlock();
       bool ok;
-      if (cpu) ok = gpu_stream_job(bank, jframe);
+      // DS_GPU_JOB_FAIL_AT=N (debug): the Nth job is not submitted, as a failed submit.
+      static const u64 fail_at = std::getenv("DS_GPU_JOB_FAIL_AT") ? std::strtoull(std::getenv("DS_GPU_JOB_FAIL_AT"), nullptr, 10) : 0;
+      static u64 job_n = 0;
+      if (fail_at && ++job_n == fail_at) ok = false;
+      else if (cpu) ok = gpu_stream_job(bank, jframe);
       else ok = lean_->submit(np, nv, ntex, f);
+      if (!ok) gpu_gen_base_.fetch_add(1, std::memory_order_relaxed);   // see gpu_gen_base_
       lk.lock();
       j->ok = ok; j->pending = false; ++j->done;
       j->cv.notify_all();
@@ -401,6 +419,23 @@ void Renderer3D::gpu_job_post(u32 np, u32 nv, u32 ntex, const vk::GpuFrame& f) {
   GpuJob* j = gpu_job_.get();
   { std::lock_guard<std::mutex> lk(j->m); j->np = np; j->nv = nv; j->ntex = ntex; j->f = f; j->cpu = false; j->pending = true; ++j->posted; }
   j->cv.notify_all();
+}
+void Renderer3D::gpu_stream_prelist(Gpu3D& gx, u32 bank) {
+  static const bool off = std::getenv("DS_GPU_PRELIST") && std::atoi(std::getenv("DS_GPU_PRELIST")) == 0;   // debug: the list with the submit, as before
+  GpuJob* j = gpu_job_.get();
+  if (!j || !gpu_on_ || !lean_ || off) return;
+  {
+    std::lock_guard<std::mutex> lk(j->m);
+    if (j->pending || j->list || j->list_busy) return;
+    j->list = true; j->list_gx = &gx; j->list_bank = bank;
+  }
+  j->cv.notify_all();
+}
+void Renderer3D::gpu_prelist_wait() {
+  GpuJob* j = gpu_job_.get();
+  if (!j) return;
+  std::unique_lock<std::mutex> lk(j->m);
+  j->cv.wait(lk, [j] { return !j->list && !j->list_busy; });
 }
 bool Renderer3D::gpu_job_wait() {
   GpuJob* j = gpu_job_.get();
@@ -2206,7 +2241,15 @@ void Renderer3D::flush_batch(const Shade& sh) {
 // translucent blend rules, polygon-id stencil, and depth interactions);
 // Slope::step still advances one line at a time via the Edge's own cursors.
 void Renderer3D::render_chunk(s32 ya, s32 yb) {
-  for (s32 y = ya; y < yb; ++y) { clear_line(y); line_touched_[y] = false; prev_shadow_mask_[static_cast<u32>((y + 1) & (RING - 1))] = false; }
+  // A line's stencil row starts empty: a shadow polygon on a line no mask
+  // was drawn on shadows nothing there, instead of reading what another line
+  // (whichever last used the ring's row) left behind.
+  for (s32 y = ya; y < yb; ++y) {
+    clear_line(y); line_touched_[y] = false;
+    const u32 srow = static_cast<u32>((y + 1) & (RING - 1));
+    prev_shadow_mask_[srow] = false;
+    std::memset(&stencil_[256 * srow], 0, 256);
+  }
   // order_ is bucketed by ytop then list index, so a whole chunk's slice spans
   // several buckets and is NOT in list order; sort it by index first (at most
   // polygon count, once per chunk) before merging into the active list.
@@ -2672,6 +2715,60 @@ void Renderer3D::clear_line(s32 y) {
 // The polygon itself goes out as it is, so every pixel still drawn is the same; an alpha-0 texel draws nothing
 // in every blend mode but decal, so only empty pixels are left out. Returns 1: nothing to do; 2: `rect` (x0, y0,
 // x1, y1 in DS pixels, the last two exclusive) is the scissor; 0: no texel of the range has alpha.
+// DS_PF_SPRITE (vk_layout.h). Smaller than what gpu_tex_clip cuts, so the two never meet.
+static u32 gpu_sprite(const vk::GpuPoly& o, const vk::GpuVert* v) {
+  using namespace ds::gpu::vk;
+  static const bool on = !(std::getenv("DS_GPU_SPRITE") && std::getenv("DS_GPU_SPRITE")[0] == '0');   // DS_GPU_SPRITE=0: every polygon as the game's own triangles (A/B)
+  if (!on) return 0;
+  if (o.nverts != 4 || (o.flags & (DS_PF_SHADOW | DS_PF_SHADOW_MASK)) || v[1].w != v[0].w || v[2].w != v[0].w || v[3].w != v[0].w) return 0;
+  const s32 ax = v[1].sx - v[0].sx, ay = v[1].sy - v[0].sy, bx = v[2].sx - v[1].sx, by = v[2].sy - v[1].sy;
+  if (!((ax != 0 && ay == 0 && bx == 0 && by != 0) || (ax == 0 && ay != 0 && bx != 0 && by == 0))) return 0;
+  if (v[3].sx != v[0].sx + bx || v[3].sy != v[0].sy + by) return 0;
+  if (v[3].s != v[0].s + v[2].s - v[1].s || v[3].t != v[0].t + v[2].t - v[1].t) return 0;   // the texture on one plane
+  s32 x0 = v[0].fx, x1 = x0, y0 = v[0].fy, y1 = y0;
+  for (u32 k = 1; k < 4; ++k) { x0 = std::min(x0, v[k].fx); x1 = std::max(x1, v[k].fx); y0 = std::min(y0, v[k].fy); y1 = std::max(y1, v[k].fy); }
+  if (s64{x1 - x0} * (y1 - y0) >= s64{64 * 16} * (48 * 16)) return 0;
+  // Texels a pixel along each side, in 12.4 over whole pixels: 3/4 to 4/3.
+  const s32 la = std::abs(ax + ay) * 16, lb = std::abs(bx + by) * 16;
+  const s32 ta = std::max(std::abs(v[1].s - v[0].s), std::abs(v[1].t - v[0].t)), tb = std::max(std::abs(v[2].s - v[1].s), std::abs(v[2].t - v[1].t));
+  if (ta * 4 < la * 3 || ta * 3 > la * 4 || tb * 4 < lb * 3 || tb * 3 > lb * 4) return 0;
+  return DS_PF_SPRITE;
+}
+
+// A sprite (DS_PF_SPRITE) goes onto whole pixels, which is the DS's own place for it; a polygon of the 3D world
+// stays on its 28.4 position. A small flat tile of a mesh can pass gpu_sprite's test beside a larger one that does
+// not, and the two then cover the row (column) between them by different rules: Pokémon Platinum's floor, a tile
+// 112 x 12 px beside one 112 x 67 along y = 73.875, the row between drawn by neither and edge-marked black on both
+// sides, a seam that opened and closed as the camera moved. So a sprite joined through a shared vertex (the
+// same 28.4 position), directly or through other sprites, to a polygon that is not one is not a sprite either: its
+// mesh keeps one rule. Sprites that only meet each other (a HUD's tiles) stay on whole pixels.
+static void gpu_sprite_mesh(vk::GpuPoly* gp, u32 np, const vk::GpuVert* gv) {
+  using namespace ds::gpu::vk;
+  std::vector<u32> parent;   // union-find over the sprites, by index into gp
+  std::unordered_map<u64, u32> at;   // a sprite's vertex position -> a sprite there
+  for (u32 i = 0; i < np; ++i) if (gp[i].flags & DS_PF_SPRITE) { if (parent.empty()) { parent.resize(np); at.reserve(64); } parent[i] = i; }
+  if (parent.empty()) return;
+  auto find = [&](u32 x) { while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  auto key = [&](const GpuVert& v) { return (u64(u32(v.fx)) << 32) | u32(v.fy); };
+  for (u32 i = 0; i < np; ++i) {
+    if (!(gp[i].flags & DS_PF_SPRITE)) continue;
+    for (u32 k = 0; k < gp[i].nverts; ++k) {
+      auto [it, fresh] = at.try_emplace(key(gv[gp[i].first_vert + k]), i);
+      if (!fresh) { const u32 a = find(i), b = find(it->second); if (a != b) parent[a] = b; }
+    }
+  }
+  std::vector<u8> meshed(np, 0);   // by root
+  bool any = false;
+  for (u32 i = 0; i < np; ++i) {
+    if (gp[i].flags & DS_PF_SPRITE) continue;
+    for (u32 k = 0; k < gp[i].nverts; ++k) {
+      const auto it = at.find(key(gv[gp[i].first_vert + k]));
+      if (it != at.end()) { meshed[find(it->second)] = 1; any = true; }
+    }
+  }
+  if (any) for (u32 i = 0; i < np; ++i) if ((gp[i].flags & DS_PF_SPRITE) && meshed[find(i)]) gp[i].flags &= ~DS_PF_SPRITE;
+}
+
 static u32 gpu_tex_clip(const TextureCache::Ref& r, const vk::GpuPoly& o, const vk::GpuVert* v, s32 rect[4]) {
   using namespace ds::gpu::vk;
   const u32 n = o.nverts;
@@ -2780,7 +2877,7 @@ void Renderer3D::gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npol
   std::unordered_map<const u32*, u32> arena;   // decoded texture -> word offset
   bool any_mask = false;
   for (u32 i = 0; i < npoly; ++i) any_mask = any_mask || (polys[i]->shadow_mask && !polys[i]->degenerate);
-  u32 first_ordered = ~0u;
+  u32 first_ordered = ~0u, nsprite = 0;
   const bool alpha_all_fail = rs_->alpha_ref >= 31;
   for (u32 i = 0; i < npoly; ++i) {
     const Polygon& p = *polys[i];
@@ -2818,6 +2915,7 @@ void Renderer3D::gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npol
         const bool may_alpha = (p.texparam & (1u << 29)) || fmt == 5 || fmt == 7 || fmt == 1 || fmt == 6;   // as gpu_submit
         if (may_alpha && gpu_alpha_tested(r, o, gv.data() + o.first_vert)) o.flags |= DS_PF_TEX_ALPHA;
         o.flags |= gpu_alpha_passes(&r, o, gv.data() + o.first_vert);
+        o.flags |= gpu_sprite(o, gv.data() + o.first_vert); nsprite += (o.flags & DS_PF_SPRITE) != 0;
       }
     }
     if (!(o.flags & DS_PF_TEXTURED)) o.flags |= gpu_alpha_passes(nullptr, o, gv.data() + o.first_vert);
@@ -2826,6 +2924,7 @@ void Renderer3D::gpu_dump(const Gpu3D& gx, const Polygon* const* polys, u32 npol
     shrun.insert(shrun.end(), run.begin(), run.end());
   }
   if (first_ordered == ~0u) first_ordered = static_cast<u32>(gp.size());
+  if (nsprite) gpu_sprite_mesh(gp.data(), static_cast<u32>(gp.size()), gv.data());
   GpuDumpHeader h;
   h.npoly = static_cast<u32>(gp.size()); h.nvert = static_cast<u32>(gv.size()); h.ntexels = static_cast<u32>(tex.size()); h.frame = nds_.frame_count;
   h.f.npoly = h.npoly; h.f.scale = 1; h.f.dispcnt = dispcnt_; h.f.alpha_ref = rs_->alpha_ref;
@@ -2916,6 +3015,7 @@ void Renderer3D::render(const Gpu3D& gx) {
       GpuJob* j = gpu_job_.get();
       { std::lock_guard<std::mutex> lk(j->m); j->cpu = true; j->bank = gx.stream_bank(); j->frame = nds_.frame_count; j->pending = true; ++j->posted; }
       j->cv.notify_all();
+      tl::ev("J_post");
     }
     gpu_frame_ = true; ++gpu_gen_; pending_bands_ = 0; geom_drawn_ = true;
     return;
@@ -2926,7 +3026,9 @@ void Renderer3D::render(const Gpu3D& gx) {
   // An unchanged polygon list + registers still needs every texture it uses
   // validated (a memcmp each) in case VRAM changed underneath; the previous
   // colour buffer is kept only if nothing needed re-decoding.
-  if (gx.render_identical() && rendered_once_ && aa_ == aa_rendered_) {
+  // Not with a rear-plane bitmap: its picture and depth are texture VRAM (and
+  // an offset register) that nothing here watches.
+  if (gx.render_identical() && rendered_once_ && aa_ == aa_rendered_ && !(rs_->dispcnt & (1u << 14))) {
     for (u32 i = 0; i < gx.render_polygon_count(); ++i) {
       const Polygon& p = *polys[i];
       const u32 fmt = (p.texparam >> 26) & 7;
@@ -3257,6 +3359,64 @@ GpuTrace g_gpu_trace;
 inline double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 }
 
+// A polygon narrower than a pixel: its vertices all on one line, or nearly. The DS's raster
+// fills at least a pixel a row between a polygon's edges, so such a polygon
+// is a line one pixel wide (The Dark Spire draws its wireframe dungeon with
+// opaque quads squeezed flat); a GPU's triangle fill covers no pixel centre
+// of it and drew nothing. It becomes the quad that covers what the DS does:
+// a pixel a row along a steep line (rows top to bottom, the last one left
+// out as for any polygon), a pixel a column along a shallow one. Both
+// rasters draw the list, so both get it. Untextured polygons only, as
+// DeSmuME's line detection (gfx3d.cpp GeneratePolygon), whose OpenGL
+// renderer draws these as GL lines: a textured polygon seen edge-on is left
+// to the triangle fill. False: not a line, nothing changed.
+static bool gpu_line_quad(vk::GpuPoly& o, vk::GpuVert* v) {
+  using vk::GpuVert;
+  const u32 n = o.nverts;
+  u32 ia = 0, ib = 0;
+  s64 far = -1;
+  for (u32 j = 0; j < n; ++j) for (u32 k = j + 1; k < n; ++k) {   // the two ends: the pair farthest apart
+    const s64 ex = v[j].fx - v[k].fx, ey = v[j].fy - v[k].fy, dist = ex * ex + ey * ey;
+    if (dist > far) { far = dist; ia = j; ib = k; }
+  }
+  // Every vertex within a pixel of the line through the ends, in the 28.4
+  // positions: narrower than a pixel all along, it is on the DS a pixel a row
+  // (or a column) whatever its width. The Dark Spire's two "sides" are a
+  // sixteenth apart; X-Scape's lines are slivers of every width, a third of
+  // them under a pixel.
+  {
+    const s64 ex = v[ib].fx - v[ia].fx, ey = v[ib].fy - v[ia].fy;
+    for (u32 j = 0; j < n; ++j) {
+      const s64 cross = ex * (v[j].fy - v[ia].fy) - ey * (v[j].fx - v[ia].fx);
+      if (cross * cross >= 256 * far) return false;
+    }
+    if (far == 0) return false;   // a point: left as it is
+  }
+  const s32 dx = v[ib].sx - v[ia].sx, dy = v[ib].sy - v[ia].sy;
+  const bool steep = std::abs(dy) >= std::abs(dx);
+  if (steep ? v[ia].sy > v[ib].sy : v[ia].sx > v[ib].sx) std::swap(ia, ib);
+  const GpuVert a = v[ia], b = v[ib];
+  GpuVert q[4] = {a, a, b, b};
+  if (steep) {
+    const s32 y1 = b.sy > a.sy ? b.sy : a.sy + 1;   // a flat one is still a row
+    q[0].sx = a.sx; q[1].sx = a.sx + 1; q[2].sx = b.sx + 1; q[3].sx = b.sx;
+    q[0].sy = q[1].sy = a.sy; q[2].sy = q[3].sy = y1;
+  } else {
+    q[0].sy = a.sy; q[1].sy = a.sy + 1; q[2].sy = b.sy + 1; q[3].sy = b.sy;
+    // Rising to the right, each row's run on the DS stops short of where the row above begins: a pixel to the left.
+    const s32 lean = b.sy < a.sy ? -1 : 0;
+    q[0].sx = q[1].sx = a.sx + lean; q[2].sx = q[3].sx = b.sx + 1 + lean;
+    std::swap(q[1], q[3]);   // left end top, right end top, right end bottom, left end bottom: xmin from q[0]/q[3]
+  }
+  for (GpuVert& c : q) { c.fx = c.sx * 16; c.fy = c.sy * 16; }
+  for (u32 j = 0; j < 4; ++j) v[j] = q[j];
+  o.nverts = 4;
+  s32 ytop = q[0].sy, ybot = q[0].sy; u32 vb = 0;
+  for (u32 j = 1; j < 4; ++j) { ytop = std::min(ytop, q[j].sy); if (q[j].sy > ybot) { ybot = q[j].sy; vb = j; } }
+  o.ytop = ytop; o.ybot = std::max(ytop, ybot - 1); o.vbot = (o.vbot & ~0xFFFFu) | vb;
+  return true;
+}
+
 bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 npoly) {
   using namespace ds::gpu::vk;
   const double t0 = g_gpu_trace.on ? now_ms() : 0;
@@ -3266,32 +3426,59 @@ bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 np
   GpuVert* const gv = lean_->vert_buffer();
   u32 texcap = 0; u32* const tex = lean_->texel_buffer(&texcap);
   GpuPost* const ps = lean_->post_buffer();
-  u32 np = 0, nv = 0, first_ordered = ~0u;
+  u32 np = 0, nv = 0, first_ordered = ~0u, nsprite = 0;
   u32 sc_cap = 0, nsc = 0; Raster3D::Scissor* const sc_buf = lean_->scissor_buffer(&sc_cap);
   lean_->scissor_count(0);
   const bool alpha_all_fail = rs_->alpha_ref >= 31;
   for (u32 i = 0; i < npoly; ++i) {
     const Polygon& p = *polys[i];
     if (p.degenerate) continue;
-    if (np >= DS_MAX_POLYS || nv + p.nverts > DS_MAX_VERTS) return false;
+    // A wireframe polygon (alpha 0): the DS draws its outline alone. Each edge
+    // goes into the list as the one-pixel quad along it (gpu_line_quad), an
+    // opaque polygon with the wireframe's attributes otherwise, so both
+    // rasters draw it with what they have. (tools/homebrew/wiretest is the
+    // test: no game on hand draws one.)
+    const bool wire = ((p.attr >> 16) & 0x1F) == 0 && !p.shadow_mask && !p.shadow;
+    for (u32 piece = 0, pieces = wire ? p.nverts : 1; piece < pieces; ++piece) {
+    if (np >= DS_MAX_POLYS || nv + std::max<u32>(p.nverts, 4) > DS_MAX_VERTS) return false;
     if (first_ordered == ~0u && (alpha_all_fail || p.translucent || p.shadow_mask || p.shadow)) first_ordered = np;
     GpuPoly& o = gp[np];
     o = GpuPoly{};
-    o.first_vert = nv; o.nverts = p.nverts; o.attr = p.attr; o.texparam = p.texparam;
+    o.first_vert = nv; o.nverts = wire ? 2 : p.nverts; o.attr = wire ? p.attr | 0x001F0000u : p.attr; o.texparam = p.texparam;
     o.ytop = p.ytop; o.ybot = p.ybot; o.span_base = DS_SPAN_NONE; o.vbot = p.vbot;
     if (poly_dump()) o.vbot |= np << 16;   // the raster reorders the opaque records: the number travels with the record (lean.frag DS_POLY_DEBUG)
     o.flags = (p.translucent ? DS_PF_TRANSLUCENT : 0u) | (p.wbuffer ? DS_PF_WBUFFER : 0u) | (p.facing ? DS_PF_FRONTFACING : 0u) |
               (p.shadow_mask ? DS_PF_SHADOW_MASK : 0u) | (p.shadow ? DS_PF_SHADOW : 0u);
     s32 xmin = 0x7FFFFFFF, xmax = -0x7FFFFFFF;
-    for (u32 j = 0; j < p.nverts; ++j) {
-      const Vertex& v = gx.vertex(p.vtx[j]);
+    for (u32 j = 0; j < o.nverts; ++j) {
+      const u32 src = wire ? (piece + j) % p.nverts : j;
+      const Vertex& v = gx.vertex(p.vtx[src]);
       GpuVert& d = gv[nv + j];
-      d.sx = v.sx; d.sy = v.sy; d.z = p.z[j]; d.w = p.w[j]; d.r = v.fcol[0]; d.g = v.fcol[1]; d.b = v.fcol[2]; d.s = v.tex[0]; d.t = v.tex[1]; d.fx = v.fx; d.fy = v.fy;
+      d.sx = v.sx; d.sy = v.sy; d.z = p.z[src]; d.w = p.w[src]; d.r = v.fcol[0]; d.g = v.fcol[1]; d.b = v.fcol[2]; d.s = v.tex[0]; d.t = v.tex[1]; d.fx = v.fx; d.fy = v.fy;
       d.pad_ = 0;
       xmin = std::min(xmin, d.sx); xmax = std::max(xmax, d.sx);
     }
     o.xmin = xmin; o.xmax = xmax;
-    nv += p.nverts;
+    const bool as_line = wire || (!p.shadow_mask && !p.shadow && ((p.texparam >> 26) & 7) == 0);
+    s32 mid2x = 0, mid2y = 0; bool steep_edge = false;
+    if (wire) { mid2x = gv[nv].sx + gv[nv + 1].sx; mid2y = gv[nv].sy + gv[nv + 1].sy; steep_edge = std::abs(gv[nv + 1].sy - gv[nv].sy) >= std::abs(gv[nv + 1].sx - gv[nv].sx); }
+    if (as_line && gpu_line_quad(o, gv + nv)) {
+      if (wire) {
+        // The outline is the polygon's own outermost pixels: its right side
+        // and its bottom stop a pixel short of the edge, as its fill does.
+        s64 cx = 0, cy = 0;
+        for (u32 j = 0; j < p.nverts; ++j) { const Vertex& v = gx.vertex(p.vtx[j]); cx += v.sx; cy += v.sy; }
+        const s32 inx = (steep_edge && static_cast<s64>(mid2x) * p.nverts > 2 * cx) ? -1 : 0;
+        const s32 iny = (!steep_edge && static_cast<s64>(mid2y) * p.nverts > 2 * cy) ? -1 : 0;
+        for (u32 j = 0; j < 4; ++j) { GpuVert& d = gv[nv + j]; d.sx += inx; d.sy += iny; d.fx = d.sx * 16; d.fy = d.sy * 16; }
+        // ... and a top or bottom run ends a pixel short of the right corner, which the right side's own pixel is.
+        if (!steep_edge && gv[nv + 1].sx - gv[nv].sx > 1) for (u32 j = 1; j <= 2; ++j) { GpuVert& d = gv[nv + j]; d.sx -= 1; d.fx = d.sx * 16; }
+        o.ytop += iny; o.ybot += iny;
+      }
+      o.xmin = std::min(gv[nv].sx, gv[nv + 3].sx); o.xmax = std::max(gv[nv + 1].sx, gv[nv + 2].sx);
+    }
+    else if (wire) continue;   // an edge with both ends on one point
+    nv += o.nverts;
     const u32 fmt = (p.texparam >> 26) & 7;
     if ((dispcnt_ & 1) && fmt != 0) {
       Shade sh; texture_fields(sh, p);
@@ -3316,11 +3503,14 @@ bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 np
       }
       if (may_alpha && gpu_alpha_tested(r, o, gv + o.first_vert)) o.flags |= DS_PF_TEX_ALPHA;
       o.flags |= gpu_alpha_passes(&r, o, gv + o.first_vert);
+      o.flags |= gpu_sprite(o, gv + o.first_vert); nsprite += (o.flags & DS_PF_SPRITE) != 0;
     }
     if (!(o.flags & DS_PF_TEXTURED)) o.flags |= gpu_alpha_passes(nullptr, o, gv + o.first_vert);
     ++np;
+    }
   }
   if (first_ordered == ~0u) first_ordered = np;
+  if (nsprite) gpu_sprite_mesh(gp, np, gv);
   *ps = GpuPost{};
   ps->fog_color = rs_->fog_color; ps->fog_offset = rs_->fog_offset; ps->fog_shift = rs_->fog_shift;
   for (u32 i = 0; i < rs_->fog_density.size() && i < 34; ++i) ps->density[i] = rs_->fog_density[i];
@@ -3331,7 +3521,7 @@ bool Renderer3D::gpu_submit(const Gpu3D& gx, const Polygon* const* polys, u32 np
   f.first_ordered = first_ordered;
   for (u32 i = 0; i < npoly; ++i) if (!polys[i]->degenerate) { if (polys[i]->wbuffer) f.flags |= DS_FF_WBUFFER; break; }
   if (lean_->msaa()) f.flags2 |= DS_FF2_MSAA;
-  if (rs_->dispcnt & 0x10u) f.flags2 |= DS_FF2_GAME_AA;   // vertices on pixel corners (lean.vert)
+  if (dispcnt_ & 0x10u) f.flags2 |= DS_FF2_GAME_AA;   // edge marks at half coverage, as the CPU raster's: the game's bit under video.aa (off: marks at full strength)
   {
     const u16 c = static_cast<u16>(rs_->clear_attr1);
     auto ch = [](u16 v, u32 shift) { u32 x = (shift == 0 ? (v << 1) : (v >> shift)) & 0x3E; return x ? x + 1 : x; };
@@ -3402,8 +3592,13 @@ bool Renderer3D::gpu_stream_post(bool* same_textures) {
 
 // Submit thread: the list from the stream, then filled and submitted as any list frame.
 bool Renderer3D::gpu_stream_job(u32 bank, u64 frame) {
+  tl::ev("J_start");
   job_texcache_.begin_frame(frame);
-  const u32 n = const_cast<Gpu3D*>(gx_)->stream_list(bank, job_polys_);   // the bank's RAM is this frame's alone (Gpu3D::StreamEmit)
+  // The list built ahead, if it is this bank's stream still; else here (the bank's RAM is this frame's alone: Gpu3D::StreamEmit).
+  const bool pre = pre_serial_ && pre_bank_ == bank && pre_serial_ == gx_->stream_serial(bank);
+  const u32 n = pre ? pre_n_ : const_cast<Gpu3D*>(gx_)->stream_list(bank, job_polys_);
+  pre_serial_ = 0;
+  tl::ev("J_list", n);
   on_job_ = true; gpu_arena_reset_ = false;
   bool ok = gpu_submit(*gx_, job_polys_.data(), n);
   if (!ok && gpu_arena_reset_) ok = gpu_submit(*gx_, job_polys_.data(), n);   // the arena was full and is empty now
@@ -3652,7 +3847,13 @@ void Renderer3D::render_band(s32 y0, s32 y1, u32* dst) {
 
 template <class S> void Renderer3D::sync_output(S& s) {
   sync_all();
-  if constexpr (S::reading) { reset(); texcache_.clear(); job_have_snap_ = false; gpu_frame_ = false; gpu_lag_floor_ = gpu_gen_; }   // the banks' bytes are the state's now
+  if constexpr (S::reading) {
+    if (gpu_frame_) gpu_job_wait();
+    reset(); texcache_.clear(); job_have_snap_ = false;   // the banks' bytes are the state's now
+    // The picture is the state's (out_ below), not the one the GPU raster of
+    // the session being replaced drew last; its next frame is a new one.
+    gpu_frame_ = false; geom_drawn_ = false; gpu_lag_floor_ = gpu_gen_;
+  }
   if constexpr (!S::reading) { if (gpu_frame_ && lean_) { gpu_job_wait(); if (const u32* g = lean_->newest_ready(false)) std::memcpy(out_[display_].data(), g, sizeof(u32) * 256 * 192); } }
   s.begin("R3DO");
   s.fields(rendered_once_, out_[display_]);   // reset() above leaves display_ at 0 on a load

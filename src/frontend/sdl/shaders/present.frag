@@ -29,14 +29,21 @@ layout(constant_id = 0) const uint FILTER = 0u;   // GpuPresent::Filter: 0 neare
 // What the pipeline's draws use (gpu_present.cpp picks the pipeline by it): 1 unused, 2 the LCD grid, 4 the
 // overlay, and in the merge 8 more than one texel to a panel pixel, 16 a captured image's coordinates, 32 BG0's
 // scroll, 64 a capture's 15-bit words, 128 master brightness; bits 8-10 the 3D layer's scale when it is known (0:
-// asked of the image); bit 11 the merge was made in a pass before this one, at the layer's scale, and is in `merged`.
+// asked of the image); bit 11 the merge was made in a pass before this one, at the layer's scale, and is in `merged`;
+// bit 12 the merged pixel is colour-corrected here (lut()); bits 13-14, with bit 11, the filter the view takes
+// `merged` through (GpuPresent::Filter: 1 bilinear, 2 seams, 3 seams in linear light, the image then an sRGB view).
 // The rest is compiled out: with all of it in, both builds ran out of registers on the
 // Mali-G52 and a 4x view cost 0.3 to 1.5 ms more.
 layout(constant_id = 1) const uint FEAT = 255u;
 layout(binding = 4) uniform sampler2DArray frame;
 layout(binding = 5) uniform sampler2DArray frame_srgb;   // the same, decoded to linear before filtering
 
-float frame_layer() { uint q = pc.b.z / 49152u; return float((q >> 2) * 2u + (q & 3u)); }   // slot * 2 + screen
+// The frame's layer of the filters' image, slot * 2 + screen, from the view's base in `src`: a slot there is
+// SLOT_PLANES planes (gpu_present.cpp kSlotPlanes; the screens are its first two). It was taken as 4 after the
+// 3D merge's planes made it 9: the second slot's frames then came from layers that are not there, which the
+// sampler turned into one screen's last frame on both views, every other frame, under bilinear and blended seams.
+const uint SLOT_PLANES = 9u;
+float frame_layer() { uint q = pc.b.z / 49152u; return float((q / SLOT_PLANES) * 2u + q % SLOT_PLANES); }
 uint pack8(vec3 c) { uvec3 b = uvec3(round(clamp(c, 0.0, 1.0) * 255.0)); return 0xFF000000u | (b.r << 16) | (b.g << 8) | b.b; }
 vec3 encode_srgb(vec3 l) { return mix(l * 12.92, 1.055 * pow(l, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), l)); }
 
@@ -114,6 +121,32 @@ vec3 merge_texel(uint w, uint op, uint s, uvec4 p, uint lt) {
 // (the frame's pixel and the word are that one's): whole ratios make it the
 // box filter, and nothing of the image is skipped. The record is merged
 // texel by texel, never filtered first (colour and alpha are packed).
+// Colour correction of a merged pixel (FEAT bit 12): the table after the slots in `src` (gpu_present.cpp
+// kLutWords), a word for each colour of 6 bits a channel, which is what the core and the merge make (a mean of
+// several texels goes to the nearest). The frame of a merged screen is uploaded uncorrected: this is its only one.
+const uint LUT_BASE = 2u * SLOT_PLANES * 49152u;   // kSlots * kSlotWords
+vec3 lut(vec3 c) {
+  uvec3 q = uvec3(clamp(c, 0.0, 255.0) + 0.5) >> 2u;
+  return unpack(src[LUT_BASE + (q.r | (q.g << 6) | (q.b << 12))]);
+}
+
+// seam_px over the merged picture: the same rule between the texels of `merged`, `psc` of them a DS pixel
+// (a 2D pixel is psc x psc equal texels there, so its seams fall where they did). `lin`: blended in linear light.
+vec3 seam_merged(ivec2 o, int psc, bool lin) {
+  vec2 sz = vec2(256.0, 192.0) * float(psc);
+  // floor(o * sz / rect), the +0.5 against the division's error (the fraction is a multiple of 1/rect).
+  int sx = min(int((float(o.x) * sz.x + 0.5) / float(pc.rect.z)), int(sz.x) - 1);
+  int sy = min(int((float(o.y) * sz.y + 0.5) / float(pc.rect.w)), int(sz.y) - 1);
+  float vf = float(sy + 1) * float(pc.rect.w) - sz.y * float(o.y);
+  bool vrow = sy < int(sz.y) - 1 && vf < sz.y;
+  float hf = float(sx + 1) * float(pc.rect.z) - sz.x * float(o.x);
+  bool hcol = sx < int(sz.x) - 1 && hf < sz.x;
+  vec2 t = vec2(float(sx) + 0.5 + (hcol ? (sz.x - hf) / sz.x : 0.0),
+                float(sy) + 0.5 + (vrow ? floor((sz.y - vf) * (256.0 / sz.y) + 0.001) / 256.0 : 0.0));
+  vec3 c = textureLod(merged, t / sz, 0.0).rgb;
+  return round((lin ? encode_srgb(c) : c) * 255.0);
+}
+
 vec3 merge3d(uint s, int sx, int sy, float fx, float fy) {
   uint mp = ((pc.b.y >> 8) & 255u) * 49152u;
   uint at = uint(sy) * 256u + uint(sx);
@@ -168,8 +201,14 @@ void main() {
   if (!seams && (pc.b.y >> 8) != 0u) {
     if ((FEAT & 0x800u) != 0u) {
       const int psc = int((FEAT >> 8) & 7u);   // the same texel merge3d would fetch
-      col = round(texelFetch(merged, min(ivec2(vec2(fx, fy) * float(psc)), ivec2(256, 192) * psc - 1), 0).rgb * 255.0);
-    } else col = merge3d(src[pc.b.z + uint(sy) * 256u + uint(sx)], sx, sy, fx, fy);
+      const uint mf = (FEAT >> 13) & 3u;
+      if (mf == 1u) { dst = vec4(textureLod(merged, d / vec2(pc.rect.zw), 0.0).rgb, 1.0); return; }
+      if (mf >= 2u) col = seam_merged(o, psc, mf == 3u);
+      else col = round(texelFetch(merged, min(ivec2(vec2(fx, fy) * float(psc)), ivec2(256, 192) * psc - 1), 0).rgb * 255.0);
+    } else {
+      col = merge3d(src[pc.b.z + uint(sy) * 256u + uint(sx)], sx, sy, fx, fy);
+      if ((FEAT & 0x1000u) != 0u) col = lut(col);
+    }
   }
   else
 #endif

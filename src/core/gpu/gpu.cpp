@@ -59,6 +59,7 @@ Gpu::Gpu(NDS& nds) : engine{Engine2D(nds, 0), Engine2D(nds, 1)}, nds_(nds) {
   stat_on_ = std::getenv("DS_SPLIT3D") || std::getenv("DS_SPLIT_STAT");
   cap_follow_ = true;
   cap_late_ok_ = !(std::getenv("DS_CAP_SYNC") && std::atoi(std::getenv("DS_CAP_SYNC")) != 0);
+  if (const char* r = std::getenv("DS_2D_REPEAT")) repeat_mode_ = std::atoi(r);
   split_cap_ = !(std::getenv("DS_SPLIT3D_NOCAP") && std::atoi(std::getenv("DS_SPLIT3D_NOCAP")) != 0);   // debug: captured images shown again stay as they are
   if (const char* e = std::getenv("DS_SPLIT3D")) {
     split3d_verify_ = !std::strcmp(e, "verify");
@@ -67,12 +68,23 @@ Gpu::Gpu(NDS& nds) : engine{Engine2D(nds, 0), Engine2D(nds, 1)}, nds_(nds) {
   }
 }
 
+// DISPCAPCNT is read as each line is drawn. In a batched frame the lines
+// before the write are drawn first, with the value they had: a game that
+// changes the capture's source or blend mid-frame gets it from that line on.
+void Gpu::capcnt_set(u32 v) {
+  if (v == capcnt_) return;
+  if (capture_on_) catch_up(1);
+  capcnt_ = v;
+}
+
 Gpu::~Gpu() {
+  late_join();
   const bool stat = std::getenv("DS_SPLIT3D") || std::getenv("DS_SPLIT_STAT");
   if (stat && (split_miss_cpu_ || split_miss_mixed_))
     std::fprintf(stderr, "split3d: 3D lines left to the 1x composite: %llu of a frame drawn on the CPU, %llu on a screen already showing a captured frame\n",
                  static_cast<unsigned long long>(split_miss_cpu_), static_cast<unsigned long long>(split_miss_mixed_));
   if (stat && (cap_late_frames_ || cap_untagged_.load())) std::fprintf(stderr, "split3d: %u capture frames did not wait for their 3D frame (late capture), %u written again with it; %u captured lines with 3D had no tag\n", cap_late_frames_, cap_late_filled_, cap_untagged_.load());
+  if ((stat || repeat_mode_ == 2) && (rep_lines_ || rep_checked_)) std::fprintf(stderr, "repeat: %llu engine B lines not drawn (the screen's line of the frame before); verify: %llu checked, %llu differed\n", (unsigned long long)rep_lines_.load(), (unsigned long long)rep_checked_.load(), (unsigned long long)rep_bad_.load());
   if (stat && cap_frames_) std::fprintf(stderr, "split3d: %u capture frames, %u of them waiting for their 3D frame after a late capture was taken early (by a remap to textures or the ARM7 %u, a read %u, a DMA out %u)\n", cap_frames_, cap_backoff_frames_, cap_taken_remap_, cap_taken_read_, cap_taken_dma_);
   if (stat && split_scrolled_) std::fprintf(stderr, "split3d: %llu split lines had BG0 scrolled\n", static_cast<unsigned long long>(split_scrolled_));
   if (split_lines_ && stat) std::fprintf(stderr, "split3d: %llu lines split for the present, %llu frames merged on the CPU\n", static_cast<unsigned long long>(split_lines_), static_cast<unsigned long long>(split_resolved_));
@@ -88,7 +100,7 @@ Gpu::~Gpu() {
 }
 
 void Gpu::reset() {
-  join_worker();
+  join_worker(); std::memset(a_n_, 0, sizeof a_n_); late_join();
   disarm_trap();
   line_ = 0; next_vcount_ = 0xFFFF; hblank_done_ = false;
   lazy_frame_ = false; per_line_[0] = per_line_[1] = false;
@@ -97,7 +109,8 @@ void Gpu::reset() {
   master_bright_g_[0] = master_bright_g_[1] = 0;
   capcnt_ = 0; capture_on_ = false;
   fifo_.fill(0); fifo_rd_ = fifo_wr_ = 0; fifo_line_.fill(0); run_fifo_ = false;
-  for (auto& fb : fb_) fb.fill(0);
+  for (Page& pg : pages_) for (auto& fb : pg.fb) fb.fill(0);
+  page_[0] = page_[1] = front_[0] = front_[1] = 0;
   engine[0].reset(); engine[1].reset();
   set_powcnt(nds_.io.powcnt1);
   nds_.io.set_vcount(0);
@@ -135,7 +148,7 @@ void Gpu::reg_write(u32 addr, u32 width, u32 value) {
   if (r >= 0x64 && r < 0x70) {
     if (width == 32) {
       switch (r) {
-      case 0x64: capcnt_ = value & 0xEF3F1F1F; return;
+      case 0x64: capcnt_set(value & 0xEF3F1F1F); return;
       case 0x68: fifo_[fifo_wr_] = value & 0xFFFF; fifo_[fifo_wr_ + 1] = value >> 16; fifo_wr_ = (fifo_wr_ + 2) & 0xF; return;
       case 0x6C: mb(0, value & 0xC01F); return;
       default: return;
@@ -143,8 +156,8 @@ void Gpu::reg_write(u32 addr, u32 width, u32 value) {
     }
     if (width == 16) {
       switch (r) {
-      case 0x64: capcnt_ = (capcnt_ & 0xFFFF0000) | (value & 0x1F1F); return;
-      case 0x66: capcnt_ = (capcnt_ & 0x0000FFFF) | ((value & 0xEF3F) << 16); return;
+      case 0x64: capcnt_set((capcnt_ & 0xFFFF0000) | (value & 0x1F1F)); return;
+      case 0x66: capcnt_set((capcnt_ & 0x0000FFFF) | ((value & 0xEF3F) << 16)); return;
       case 0x68: fifo_[fifo_wr_] = value; return;
       case 0x6A: fifo_[fifo_wr_ + 1] = value; fifo_wr_ = (fifo_wr_ + 2) & 0xF; return;   // the write pointer advances on the high half
       case 0x6C: mb(0, value & 0xC01F); return;
@@ -152,10 +165,10 @@ void Gpu::reg_write(u32 addr, u32 width, u32 value) {
       }
     }
     switch (r) {
-    case 0x64: capcnt_ = (capcnt_ & 0xFFFFFF00) | (value & 0x1F); return;
-    case 0x65: capcnt_ = (capcnt_ & 0xFFFF00FF) | ((value & 0x1F) << 8); return;
-    case 0x66: capcnt_ = (capcnt_ & 0xFF00FFFF) | ((value & 0x3F) << 16); return;
-    case 0x67: capcnt_ = (capcnt_ & 0x00FFFFFF) | ((value & 0xEF) << 24); return;
+    case 0x64: capcnt_set((capcnt_ & 0xFFFFFF00) | (value & 0x1F)); return;
+    case 0x65: capcnt_set((capcnt_ & 0xFFFF00FF) | ((value & 0x1F) << 8)); return;
+    case 0x66: capcnt_set((capcnt_ & 0xFF00FFFF) | ((value & 0x3F) << 16)); return;
+    case 0x67: capcnt_set((capcnt_ & 0x00FFFFFF) | ((value & 0xEF) << 24)); return;
     case 0x68: fifo_[fifo_wr_] = static_cast<u16>(value * 0x0101); return;
     case 0x6A: fifo_[fifo_wr_ + 1] = static_cast<u16>(value * 0x0101); return;
     case 0x6B: fifo_wr_ = (fifo_wr_ + 2) & 0xF; return;
@@ -270,7 +283,7 @@ bool Gpu::vram_remap_begin(u32 moved_2d, const VramMap* next) {
     for (u32 b = 0; b < next->arm7.blocks(); ++b) to |= next->arm7.mask[b];
     if ((late_[0].pending && (to >> late_[0].bank & 1)) || (late_[1].pending && (to >> late_[1].bank & 1))) {
       join_worker(JoinSite::Remap);
-      if (late_fill(render_next_[0] >= SCREEN_H)) { cap_backoff_ = 600; ++cap_taken_remap_; }
+      if (late_fill(render_next_[0] >= SCREEN_H)) { cap_stand_down(); ++cap_taken_remap_; }
     }
   }
   const bool trapped = vram_remap_begin_core(moved_2d, next);
@@ -392,7 +405,7 @@ void Gpu::capture_read_hit() {
   if (snap_log) std::fprintf(stderr, "[snap] frame %llu line %u capture read hit\n", (unsigned long long)nds_.frame_count, line_);
   join_worker(JoinSite::Trap);
   // The lines of a late capture, read before the next frame's render has written them again: now.
-  if ((late_[0].pending || late_[1].pending) && late_fill(render_next_[0] >= SCREEN_H)) { cap_backoff_ = 600; ++cap_taken_read_; }
+  if ((late_[0].pending || late_[1].pending) && late_fill(render_next_[0] >= SCREEN_H)) { cap_stand_down(); ++cap_taken_read_; }
   release_read_trap(true);
 }
 
@@ -485,7 +498,12 @@ void Gpu::on_hblank() {
     u32 f[2], l[2];
     for (int e = 0; e < 2; ++e) {
       const bool batch = lazy_frame_ && !per_line_[e];
-      if (batch && line_ != SCREEN_H - 1) { f[e] = 1; l[e] = 0; continue; }   // nothing yet
+      if (batch && line_ != SCREEN_H - 1) {
+        f[e] = 1; l[e] = 0;   // nothing yet
+        // But a piece of engine A's batch (early_a_), when the piece before is done: never a wait here.
+        if (e == 0 && early_ok_ && lag_frame_ && line_ + 1u >= render_next_[0] + EARLY_A_LINES && trap_armed_ && (trap_mask_ & 1) && !a_deferred_ && worker_.done()) { f[0] = render_next_[0]; l[0] = line_; }
+        continue;
+      }
       f[e] = batch ? render_next_[e] : line_;
       l[e] = batch ? SCREEN_H - 1 : line_;
       if (!batch && render_next_[e] < line_) f[e] = render_next_[e];          // catch up anything skipped
@@ -583,9 +601,10 @@ void Gpu::on_scanline_start() {
   if (line_ >= SCREEN_H) { engine[0].latch(Engine2D::L_WINDOWS, line_, false); engine[1].latch(Engine2D::L_WINDOWS, line_, false); }
   if (line_ == 0) {
     // All display lines must be drawn before the frontend reads them and before begin_frame runs.
-    { prof::Scope j(prof::JOIN0); join_worker(JoinSite::Line0); }
+    { prof::Scope j(prof::JOIN0); join_worker(JoinSite::Line0); late_join(); }
     if (probe_enabled_) async_probe_check(true);
     { prof::Scope b(prof::BEGIN_FRAME); begin_frame(); }
+    late_prefill();
     nds_.frame_ready = true;
   } else if (line_ == 192) {
     if (probe_enabled_) async_probe_check(false);
@@ -624,8 +643,53 @@ void Gpu::update_phase() {
   phase_period_ = 1;
 }
 
+// The drawing page's lines that no frame has drawn since it became the drawing page, from the front page: what
+// one buffer would still hold there. Between frames, nothing in flight.
+void Gpu::patch_page() {
+  for (int scr = 0; scr < 2; ++scr) {
+    if (front_[scr] == page_[scr]) continue;
+    Page& d = pages_[page_[scr]];
+    const Page& f = pages_[front_[scr]];
+    const bool words = !d.split_fb[scr].empty();
+    if (page_drawn_[scr][0] == ~u64{0} && page_drawn_[scr][1] == ~u64{0} && page_drawn_[scr][2] == ~u64{0}) continue;
+    for (u32 y = 0; y < SCREEN_H; ++y) {
+      if (page_drawn_[scr][y >> 6] >> (y & 63) & 1) continue;
+      std::memcpy(d.fb[scr].data() + y * SCREEN_W, f.fb[scr].data() + y * SCREEN_W, SCREEN_W * sizeof(u32));
+      if (words) {
+        std::memcpy(d.split_fb[scr].data() + y * SCREEN_W, f.split_fb[scr].data() + y * SCREEN_W, SCREEN_W * sizeof(u32));
+        std::memcpy(d.split_xy[scr].data() + y * SCREEN_W, f.split_xy[scr].data() + y * SCREEN_W, SCREEN_W * sizeof(u32));
+      }
+      d.split_mb[scr][y] = f.split_mb[scr][y]; d.split_reg[scr][y] = f.split_reg[scr][y];
+    }
+  }
+}
+
+// Per screen, the readers' page from here: a screen that drew no line since its pages changed over keeps the
+// page it had (it is still the whole picture); else its undrawn lines are filled in and its drawing page is it.
+void Gpu::settle_pages() {
+  for (int scr = 0; scr < 2; ++scr) {
+    if (front_[scr] == page_[scr]) continue;
+    if (!(page_drawn_[scr][0] | page_drawn_[scr][1] | page_drawn_[scr][2])) page_[scr] = front_[scr];
+  }
+  patch_page();
+  front_[0] = page_[0]; front_[1] = page_[1];
+}
+
+void Gpu::hand_frame() {
+  if (scaling() || lines_in_flight()) return;
+  settle_pages();
+  page_[0] ^= 1; page_[1] ^= 1;
+  static_assert(SCREEN_H == 192, "page_drawn_ holds 192 lines");
+  for (auto& scr : page_drawn_) scr[0] = scr[1] = scr[2] = 0;
+}
+
 void Gpu::begin_frame() {
   frame_begun_ = true;
+  a_cur_ ^= 1; a_n_[a_cur_][0] = a_n_[a_cur_][1] = 0;
+  std::memset(a_ok_[a_cur_], 0, sizeof a_ok_[a_cur_]);
+  // The frame just finished is what the readers get from here, taken with hand_frame or not: the page it was
+  // drawn in, whole (the page handed before stays unwritten either way).
+  if ((front_[0] != page_[0] || front_[1] != page_[1]) && !lines_in_flight()) settle_pages();
   if (g_dbg_gpu)
     std::fprintf(stderr, "[gpu] frame %llu powcnt %04x dispcntA %08x dispcntB %08x mb %04x/%04x cap %08x vramcnt %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
                  static_cast<unsigned long long>(nds_.frame_count), nds_.io.powcnt1, engine[0].dispcnt(), engine[1].dispcnt(), master_bright_g_[0], master_bright_g_[1], capcnt_,
@@ -655,7 +719,7 @@ void Gpu::begin_frame() {
     const u32 un = cap_untagged_.load(std::memory_order_relaxed);
     if (capture_on_) cap_idle_ = 0; else if (++cap_idle_ > 4) cap_clean_ = 0;
     if (un != cap_untagged_seen_) { cap_untagged_seen_ = un; cap_clean_ = 0; } else if (capture_on_ && cap_clean_ < 255) ++cap_clean_;
-    const bool tracked = split_req_ && !scaling() && !(colour_lut_ && colour_cpu_) && !raw_active_ && nds_.gpu3d.renderer().gpu_layers();
+    const bool tracked = split_req_ && !scaling() && !(colour_lut_ && colour_cpu_) && !raw_active_ && nds_.gpu3d.renderer().gpu_layers() && !nds_.gpu3d.rear_fog_haze();
     if (capture_on_) { ++cap_frames_; if (cap_backoff_) ++cap_backoff_frames_; }
     if (cap_backoff_) --cap_backoff_;
     cap_late_ = capture_on_ && cap_late_ok_ && !cap_backoff_ && tracked && split_cap_ && nds_.gpu3d.renderer().gpu_scale() > 1 && ((capcnt_ >> 29) & 3) == 0 && cap_clean_ >= 3;
@@ -671,14 +735,15 @@ void Gpu::begin_frame() {
     LateCap& lc = late_[late_at_];
     ref3d_exact_ = ref3d_; ref3d_exact_.allow_lag = false; ref3d_exact_.out = nullptr;
     lc.pending = true; lc.frame = late_seq_; lc.ref = ref3d_; lc.bank = (capcnt_ >> 16) & 3; std::memset(lc.kind, 0, sizeof lc.kind);
-    if (lc.u.empty()) { lc.u.resize(SCREEN_W * SCREEN_H); lc.w.resize(SCREEN_W * SCREEN_H); }
+    if (lc.u.empty()) { lc.u.resize(SCREEN_W * SCREEN_H); lc.w.resize(SCREEN_W * SCREEN_H); lc.px.resize(SCREEN_W * SCREEN_H); }
+    lc.pre = false;
   }
   if (split_cur_.drawn) split_done_ = split_cur_;
   split_cur_ = SplitFrame{};
-  split_cur_.track = split_req_ && !scaling() && !(colour_lut_ && colour_cpu_) && !raw_active_ && nds_.gpu3d.renderer().gpu_layers();
+  split_cur_.track = split_req_ && !scaling() && !(colour_lut_ && colour_cpu_) && !raw_active_ && nds_.gpu3d.renderer().gpu_layers() && !nds_.gpu3d.rear_fog_haze();
   split_cur_.want = split_cur_.track && ref3d_.gpu;
   if (split_cur_.track && cap_words_.empty()) {
-    for (int k = 0; k < 2; ++k) { split_fb_[k].assign(SCREEN_W * SCREEN_H, 0); split_xy_[k].assign(SCREEN_W * SCREEN_H, 0); }
+    for (Page& pg : pages_) for (int k = 0; k < 2; ++k) { pg.split_fb[k].assign(SCREEN_W * SCREEN_H, 0); pg.split_xy[k].assign(SCREEN_W * SCREEN_H, 0); }
     cap_words_.assign(Engine2D::CAP_SLOTS * 65536, 0); cap_seg_.assign(Engine2D::CAP_SLOTS * 512, CapSeg{});
   }
   if (split_cur_.track != split_engine_) {   // step_engine sets engine A's split line by line while tracked
@@ -718,6 +783,13 @@ void Gpu::begin_frame() {
   lazy_tried_ = lazy_frame_ || (lazy_enabled_ && !g_no_lazy && !run_fifo_);
   lag_frame_ = !run_fifo_ && !g_no_lag;
   lag_trap_hits_ = 0; lag_trap_stores_ = 0;
+  {
+    static const bool early_on = !(std::getenv("DS_2D_EARLY") && std::getenv("DS_2D_EARLY")[0] == '0');
+    static const bool early_all = std::getenv("DS_2D_EARLY") && std::getenv("DS_2D_EARLY")[0] == '2';   // debug: every frame that may
+    if (early_all) early_a_ = EARLY_A_HOLD;
+    if (early_a_) --early_a_;
+    early_ok_ = early_on && early_a_ && lazy_frame_ && lag_frame_ && !per_line_[0] && !scaling() && !skip_frame_ && (!ref3d_.gpu || !ref3d_.allow_lag);
+  }
   if (snap_hit_) snap_want_ = SNAP_HOLD; else if (snap_want_) --snap_want_;
   snap_hit_ = false;
   arm_trap();
@@ -752,6 +824,7 @@ void Gpu::on_display_fifo(u32 x) {
 // One engine's run of display lines on the worker; engine state is disjoint.
 void Gpu::worker_job(void* self) {
   Gpu& g = *static_cast<Gpu*>(self);
+  if (g.late_job_) { for (LateCap& lc : g.late_) if (lc.pending && lc.frame != g.late_job_seq_ && !lc.pre) g.late_lines(lc); return; }
   if (g_worker_delay_us) { const auto t = std::chrono::steady_clock::now() + std::chrono::microseconds(g_worker_delay_us); while (std::chrono::steady_clock::now() < t) {} }
   for (int e = 0; e < 2; ++e)
     for (u32 l = g.job_first_[e]; l <= g.job_last_[e]; ++l) g.step_engine(e, l);
@@ -763,6 +836,7 @@ void Gpu::worker_job(void* self) {
 
 void Gpu::worker_b_job(void* self) {
   Gpu& g = *static_cast<Gpu*>(self);
+  if (g.late_job_) { for (LateCap& lc : g.late_) if (lc.pending && lc.frame != g.late_job_seq_ && !lc.pre) g.late_lines(lc); return; }
   if (g_worker_delay_us) { const auto t = std::chrono::steady_clock::now() + std::chrono::microseconds(g_worker_delay_us); while (std::chrono::steady_clock::now() < t) {} }
   for (u32 l = g.bjob_first_; l <= g.bjob_last_; ++l) g.step_engine(1, l);
 }
@@ -772,6 +846,7 @@ void Gpu::join_worker(JoinSite site) {
   if (b_deferred_) worker_b_.wait(static_cast<int>(site));
   const bool dbg = g_dbg_join;
   if (dbg) std::fprintf(stderr, "[join] frame %llu line %u hblank %d a %u..%u b %u..%u deferred %d\n", (unsigned long long)nds_.frame_count, line_, hblank_done_ ? 1 : 0, job_first_[0], job_last_[0], job_first_[1], job_last_[1], a_deferred_ ? 1 : 0);
+  if (a_deferred_ && site != JoinSite::Line0 && site != JoinSite::Other && !worker_.done()) early_a_ = EARLY_A_HOLD;
   { const u64 t0 = prof::now_ns(); worker_.wait(static_cast<int>(site));
     const u64 dt = prof::now_ns() - t0;
     join_wait_ns_ += dt; prof::add_ns(prof::W2D_JOIN, dt);
@@ -783,7 +858,7 @@ void Gpu::join_worker(JoinSite site) {
         prof::C_W2D_JOIN_NS_RPRE, prof::C_W2D_JOIN_NS_RPOST, prof::C_W2D_JOIN_NS_OTHER };
       prof::add(kBySite[static_cast<int>(site)], dt);
     } }
-  inflight_[0] = inflight_[1] = false; scale_inflight_ = false; bscale_n_ = 0;
+  inflight_[0] = inflight_[1] = false; scale_inflight_ = false; bscale_n_ = 0; early_inflight_ = false;
   for (int e = 0; e < 2; ++e) {
     engine[e].set_vram_override(nullptr);
     if (remap_pending_[e]) { engine[e].vram_remapped(); remap_pending_[e] = false; }
@@ -820,16 +895,26 @@ void Gpu::debug_dump(FILE* f) {
 void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   const bool a_has = af <= al, b_has = bf <= bl;
   if (!a_has && !b_has) return;
+  // A piece of engine A's batch in flight and engine B's line alone to draw: here, beside it (the engines'
+  // state is disjoint, and nothing is handed that would snapshot the map).
+  if (early_inflight_ && !a_has && bl < SCREEN_H - 1 && !scaling() && !inflight_[1] && !scale_inflight_) {
+    prof::add(prof::C_2D_RANGE_B, 1);
+    for (u32 x = bf; x <= bl; ++x) step_engine(1, x);
+    render_next_[1] = bl + 1;
+    return;
+  }
+  const bool early_piece = a_has && al < SCREEN_H - 1 && early_ok_ && lazy_frame_ && !per_line_[0];
   join_worker(JoinSite::RangesPre);   // a job handed now snapshots the live map: nothing stale may still be in flight
   // The captures of the frames before, before anything of this range can show them. Line 0's sprites were
   // drawn at the end of the frame before (one line ahead): again, where they may show such a bank.
-  if (late_fill()) { if (a_has && af == 0) engine[0].render_sprites(0); if (b_has && bf == 0) engine[1].render_sprites(0); }
+  if (late_fill()) { cap_backoff_len_ = CAP_BACKOFF_MIN; if (a_has && af == 0) engine[0].render_sprites(0); if (b_has && bf == 0) engine[1].render_sprites(0); }   // one that lasted to its own time: the stand-down starts short again
   capcnt_render_ = capcnt_; capture_render_ = capture_on_;
   late_render_ = cap_late_ ? late_at_ : -1;
   lcdc_mask_render_ = nds_.bus.vram_map().lcdc_mask;   // latched so the job doesn't consult a live map that may be rebuilding
   const bool dbg = g_dbg_join;
   auto hand = [&](bool a, bool b) {
     if (dbg) std::fprintf(stderr, "[hand] frame %llu line %u a %u..%u b %u..%u lag %d stash %u\n", (unsigned long long)nds_.frame_count, line_, a ? af : 1, a ? al : 0, b ? bf : 1, b ? bl : 0, lag_frame_ ? 1 : 0, bscale_n_);
+    late_join();
     job_first_[0] = a ? af : 1; job_last_[0] = a ? al : 0;
     job_first_[1] = b ? bf : 1; job_last_[1] = b ? bl : 0;
     scale_inflight_ = bscale_n_ > 0;
@@ -891,6 +976,7 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
     prof::add(prof::C_RR_LAG, 1);
     hand(a_has, false);
     a_handed = a_has;
+    early_inflight_ = early_piece;
   } else if (b_has && (b_len >= 24 || !worker_.parked())) {
     // Short run against a parked worker drawn here: wake-up costs more than the lines do.
     prof::add(prof::C_RR_HAND_B, 1);
@@ -932,6 +1018,64 @@ void Gpu::render_ranges(u32 af, u32 al, u32 bf, u32 bl) {
   }
 }
 
+static inline u32 cap_sum(const u16* p) {
+  u32 a = 0, b = 0;
+  for (u32 i = 0; i < 128; ++i) { a += p[i]; b += p[i] * (i + 1); }
+  return a ^ (b * 0x9E3779B1u);
+}
+
+// A line's split words and brightness words, as one hash (repeat_line).
+static inline u64 words_hash(const u32* w, u16 reg, u32 mbw) {
+  u64 h = 0x9E3779B97F4A7C15ull ^ (u64{reg} << 32) ^ mbw;
+  for (u32 k = 0; k < SCREEN_W; k += 2) { u64 v; std::memcpy(&v, w + k, 8); h = (h ^ v) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+  return h;
+}
+
+bool Gpu::repeat_line(int e, u32 line) {
+  if (e != 1 || !repeat_mode_ || !screens_on_ || scaling() || raw_active_ || (colour_lut_ && colour_cpu_)) return false;
+  Engine2D& en = engine[1];
+  const int sc = en.screen();
+  const u32 prev = a_cur_ ^ 1;
+  if (!a_n_[prev][sc] || !a_ok_[prev][sc][line]) return false;
+  u32 cref = 0;
+  const u8* const row = en.repeat_row(line, &cref);
+  if (!row) return false;
+  u64 h = 0x9E3779B97F4A7C15ull, acc = ~u64{0};
+  for (u32 k = 0; k < 64; ++k) { u64 w; std::memcpy(&w, row + 8 * k, 8); acc &= w; h = (h ^ w) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+  if ((acc & 0x8000800080008000ull) != 0x8000800080008000ull) return false;    // a transparent pixel shows the backdrop
+  if (h != a_hash_[prev][sc][line]) return false;
+  if (!split_cur_.track) return true;
+  // The page keeps the line's split words and brightness words too: they must be what drawing it would give.
+  // The words as split_capture_display's line path makes them for this line (one opaque layer, every pixel the
+  // capture's, master brightness off); a line it would leave to its per-pixel path is drawn.
+  SplitScreen& ss = split_cur_.s[sc];
+  alignas(16) u32 w[SCREEN_W] = {};
+  const Renderer3D::FrameRef* set_ref = nullptr;
+  if (cref && !ss.live) {
+    const u32 b = (cref >> 16) & 7, idx = cref & 0xFFFF;
+    if (idx & 0xFF) return false;
+    const CapSeg& s0 = cap_seg_[b * 512 + (idx >> 7)];
+    const CapSeg& s1 = cap_seg_[b * 512 + (((idx + 128) & 0xFFFF) >> 7)];
+    if (!(s0.gen && s0.gen == s1.gen && s0.base == s1.base && s0.width == 256 && s1.width == 256 && s0.uniform == s1.uniform && s0.each == s1.each &&
+          ((idx - s0.base) & 0xFFFF) == line * 256 && (!ss.any || ss.ref.gpu_gen == s0.gen))) return false;
+    const Renderer3D::FrameRef* ref = nullptr;
+    if (ss.any) ref = &ss.ref;
+    else for (const Renderer3D::FrameRef& c : cap_ref_) if (c.gpu && c.gpu_gen == s0.gen) { ref = &c; break; }
+    const u16* const v = reinterpret_cast<const u16*>(nds_.bus.vram_map().bank(Engine2D::cap_slot_bank(b))) + idx;
+    if (ref && cap_sum(v) == s0.sum && cap_sum(v + 128) == s1.sum) {
+      u32 n = 0;
+      if (s0.each) { const u32* const cw = cap_words_.data() + b * 65536 + idx; for (u32 x = 0; x < SCREEN_W; ++x) { w[x] = cw[x]; n += cw[x] != 0; } }
+      else { for (u32 x = 0; x < SCREEN_W; ++x) w[x] = s0.uniform; n = s0.uniform ? SCREEN_W : 0; }
+      if (n && !ss.any) set_ref = ref;
+    }
+  }
+  const u16 reg = en.master_bright();
+  const u32 mode = reg >> 14, f = std::min<u32>(reg & 0x1F, 16);
+  if (words_hash(w, reg, mode == 1 ? (16 - f) | ((63 * f) << 8) : mode == 2 ? 16 - f : 16) != a_whash_[prev][sc][line]) return false;
+  if (set_ref && repeat_mode_ == 1) { ss.any = true; ss.live = false; ss.ref = *set_ref; }
+  return true;
+}
+
 // One engine's display line, in hardware order: pre-scanline writes, window
 // edges, the line's own writes, latches, the line, its output, next line's sprites.
 void Gpu::step_engine(int e, u32 line) {
@@ -944,7 +1088,18 @@ void Gpu::step_engine(int e, u32 line) {
     en.pre_draw(line, false);
   }
   // Engine B on a hidden screen draws nothing; the line it comes back on re-renders its sprites.
-  const bool draw = !skip_frame_ && !(e == 1 && !screen_visible_[en.screen()]);
+  bool draw = !skip_frame_ && !(e == 1 && !screen_visible_[en.screen()]);
+  const bool repeat = draw && repeat_line(e, line);
+  // Verify: the line is drawn, and must come out as the page's line of the frame before.
+  alignas(16) u32 vfy_px[SCREEN_W], vfy_w[SCREEN_W]; u32 vfy_mb = 0; bool vfy_words = false;
+  if (repeat && repeat_mode_ == 2) {
+    const Page& pv = pages_[front_[en.screen()]];
+    const int sc = en.screen();
+    std::memcpy(vfy_px, pv.fb[sc].data() + line * SCREEN_W, sizeof vfy_px);
+    vfy_words = !pv.split_fb[sc].empty();
+    if (vfy_words) { std::memcpy(vfy_w, pv.split_fb[sc].data() + line * SCREEN_W, sizeof vfy_w); vfy_mb = pv.split_mb[sc][line]; }
+  }
+  if (repeat && repeat_mode_ == 1) { draw = false; rep_lines_.fetch_add(1, std::memory_order_relaxed); }
   if (!draw) skipped_[e] = true; else if (skipped_[e]) { skipped_[e] = false; en.render_sprites(line); }
   // Reading the 3D line joins the raster bands: skip it when the raster never ran.
   // The 3D split for the present's merge: this line composes without BG0 and
@@ -968,24 +1123,36 @@ void Gpu::step_engine(int e, u32 line) {
   const bool exact3d = late_render_ >= 0 && draw && !split;
   if (e == 0 && (draw || capture_render_) && (!split || capture_render_)) { prof::Scope l3(prof::R3D_LINE); line3d_ = nds_.gpu3d.line(exact3d ? ref3d_exact_ : ref3d_, line); en.set_3d_line(line3d_); }
   if (draw) { en.render_line(line); output_engine(e, line); }
+  // Engine A showing a bank: what each line showed (before the capture writes the line again), for engine B's lines of the next frame (repeat_line).
+  if (e == 0 && draw && repeat_mode_ && screens_on_ && dmode == 2 && !scaling() && !raw_active_ && !(colour_lut_ && colour_cpu_)) {
+    const u16 mb = en.master_bright();
+    const u32 bank = (en.dispcnt() >> 18) & 3;
+    if (!(((mb >> 14) == 1 || (mb >> 14) == 2) && (mb & 0x1F)) && (lcdc_mask_render_ & (1u << bank))) {
+      const int sc = en.screen();
+      const u8* const row = nds_.bus.vram_map().bank(bank) + line * 512;
+      u64 h = 0x9E3779B97F4A7C15ull;
+      for (u32 k = 0; k < 64; ++k) { u64 w; std::memcpy(&w, row + 8 * k, 8); h = (h ^ w) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+      a_hash_[a_cur_][sc][line] = h; a_ok_[a_cur_][sc][line] = true; ++a_n_[a_cur_][sc];
+    }
+  }
   // A late frame's line the engine could not split after all shows the 3D it was given, the frame before's: late capture stands down.
   if (e == 0 && draw && late_render_ >= 0 && split && !en.split_on() && (en.dispcnt() & 0x108) == 0x108) cap_untagged_.fetch_add(1, std::memory_order_relaxed);
   if (draw && split_cur_.track) {
     const bool live = split && en.split_on() && dmode == 1;
     if (live) {
-      std::memcpy(split_fb_[scr].data() + line * SCREEN_W, en.split(), SCREEN_W * sizeof(u32));
+      std::memcpy(wp(scr).split_fb[scr].data() + line * SCREEN_W, en.split(), SCREEN_W * sizeof(u32));
       SplitScreen& ss = split_cur_.s[scr];
       if (!ss.any) { ss.any = ss.live = true; ss.ref = ref3d_; }
       ++split_lines_;
     } else if (split_cap_) split_capture_display(e, line);
-    else std::memset(split_fb_[scr].data() + line * SCREEN_W, 0, SCREEN_W * sizeof(u32));
+    else std::memset(wp(scr).split_fb[scr].data() + line * SCREEN_W, 0, SCREEN_W * sizeof(u32));
     const u16 reg = en.master_bright();
     const u32 mode = reg >> 14, f = std::min<u32>(reg & 0x1F, 16);   // kern::master_brightness as one multiply-add
-    split_reg_[scr][line] = reg;
+    wp(scr).split_reg[scr][line] = reg;
     // BG0's X offset on a line with the frame's own 3D: bits 20-28 (the merge reads the 3D pixel that far along).
     const u32 xpos = live ? nds_.gpu3d.layer_xpos(line) : 0;
     if (xpos) { split_cur_.s[scr].scrolled = true; ++split_scrolled_; }
-    split_mb_[scr][line] = (mode == 1 ? (16 - f) | ((63 * f) << 8) : mode == 2 ? 16 - f : 16) | (xpos << 20);
+    wp(scr).split_mb[scr][line] = (mode == 1 ? (16 - f) | ((63 * f) << 8) : mode == 2 ? 16 - f : 16) | (xpos << 20);
   }
   if (e == 0 && capture_render_ && !skip_frame_) {
     DS_PROF(CAPTURE);
@@ -1014,6 +1181,27 @@ void Gpu::step_engine(int e, u32 line) {
         std::memcpy(lc.w.data() + line * SCREEN_W, en.split(), SCREEN_W * sizeof(u32));
         lc.kind[line] = 1;
       }
+    }
+  }
+  // Engine A's line on a shown bank: its split words as left on the page (repeat_line compares a hash of them).
+  if (e == 0 && draw && a_ok_[a_cur_][en.screen()][line]) {
+    const int sc = en.screen();
+    static const u32 kNoWords[SCREEN_W] = {};
+    const bool w = split_cur_.track && !wp(sc).split_fb[sc].empty();
+    a_whash_[a_cur_][sc][line] = words_hash(w ? wp(sc).split_fb[sc].data() + line * SCREEN_W : kNoWords, w ? wp(sc).split_reg[sc][line] : 0, w ? wp(sc).split_mb[sc][line] : 0);
+  }
+  if (repeat && repeat_mode_ == 2) {
+    const int sc = en.screen();
+    const u32* const px = wp(sc).fb[sc].data() + line * SCREEN_W;
+    bool same = std::memcmp(px, vfy_px, sizeof vfy_px) == 0;
+    if (same && vfy_words && split_cur_.track) same = std::memcmp(wp(sc).split_fb[sc].data() + line * SCREEN_W, vfy_w, sizeof vfy_w) == 0 && wp(sc).split_mb[sc][line] == vfy_mb;
+    rep_checked_.fetch_add(1, std::memory_order_relaxed);
+    if (!same && rep_bad_.fetch_add(1, std::memory_order_relaxed) < 16) {
+      u32 x = 0; while (x < SCREEN_W && px[x] == vfy_px[x]) ++x;
+      const u32* const wn = vfy_words ? wp(sc).split_fb[sc].data() + line * SCREEN_W : nullptr;
+      u32 wx = 0; if (wn) while (wx < SCREEN_W && wn[wx] == vfy_w[wx]) ++wx;
+      std::fprintf(stderr, "repeat: frame %llu screen %d line %u differs (first pixel %u: %08x drawn, %08x before; first word %u: %08x drawn, %08x before; brightness word %08x drawn, %08x before)\n", static_cast<unsigned long long>(nds_.frame_count), sc, line, x, x < SCREEN_W ? px[x] : 0u, x < SCREEN_W ? vfy_px[x] : 0u,
+                   wx, wn && wx < SCREEN_W ? wn[wx] : 0u, wx < SCREEN_W ? vfy_w[wx] : 0u, wn ? wp(sc).split_mb[sc][line] : 0u, vfy_mb);
     }
   }
   // Sprites are rendered one line ahead of the backgrounds.
@@ -1067,7 +1255,8 @@ void Gpu::output_engine(int e, u32 line) {
   const Engine2D& en = engine[e];
   const int screen = en.screen();
   const bool scaled = scaling();
-  u32* dst = scaled ? line_out_[e].data() : fb_[screen].data() + line * SCREEN_W;
+  u32* dst = scaled ? line_out_[e].data() : wp(screen).fb[screen].data() + line * SCREEN_W;
+  if (!scaled) page_drawn_[screen][line >> 6] |= u64{1} << (line & 63);
   if (screens_on_) {
     if (e == 0) {
       const u32 mode = (en.dispcnt() >> 16) & 3;
@@ -1454,11 +1643,6 @@ void Gpu::output_b(u32* dst) {
 }
 
 // 128 pixels of a bank as display capture left them: to tell them written to since.
-static inline u32 cap_sum(const u16* p) {
-  u32 a = 0, b = 0;
-  for (u32 i = 0; i < 128; ++i) { a += p[i]; b += p[i] * (i + 1); }
-  return a ^ (b * 0x9E3779B1u);
-}
 
 // Display capture: blends source A (engine A composite or the 3D layer) with
 // source B (VRAM or the display FIFO) into an LCDC-mapped bank as BGR555.
@@ -1577,6 +1761,7 @@ void Gpu::expand_colours(u32* dst) { kern::active::expand_colours(dst); }
 // The late captures of frames before this one, written again with their own 3D frame (waited for): each line
 // as capture() wrote it, where the bank still holds what that wrote. The worker is idle (render_ranges, quiesce).
 bool Gpu::late_fill(bool current) {
+  late_join();
   bool any = false;
   for (LateCap& lc : late_) {
     if (!lc.pending || (lc.frame == late_seq_ && !current)) continue;
@@ -1587,10 +1772,7 @@ bool Gpu::late_fill(bool current) {
     if (!(lc.lcdc & (1u << dst_bank))) continue;
     // The bank itself, wherever the game has mapped it since (to show it): bank pointers are remap-invariant.
     u16* const bank = reinterpret_cast<u16*>(nds_.bus.vram_map().bank(dst_bank));
-    Renderer3D::FrameRef r = lc.ref;
-    r.allow_lag = false; r.out = nullptr;   // that frame's own record
-    bool synced = false;
-    alignas(16) Pixel merged[SCREEN_W];
+    bool filled = false;
     for (u32 line = 0; line < std::min<u32>(height, SCREEN_H); ++line) {
       if (!lc.kind[line]) continue;
       const u32 cap_idx = ((((cnt >> 18) & 3) << 14) + line * width) & 0xFFFF;
@@ -1600,16 +1782,44 @@ bool Gpu::late_fill(bool current) {
       bool ours = true;
       for (u32 k = 0; k < width; k += 128) { const CapSeg& seg = cap_seg_[dst_bank * 512 + ((cap_idx + k) >> 7)]; ours = ours && seg.gen == lc.ref.gpu_gen && seg.sum == cap_sum(dst + k); }
       if (!ours) continue;
-      if (!synced) { nds_.gpu3d.renderer().sync_line(r, 0); synced = true; }
-      const Pixel* src = r.line(line);
-      if (lc.kind[line] == 1) { kern::active::split_merge_line(lc.w.data() + line * SCREEN_W, lc.u.data() + line * SCREEN_W, src, merged); src = merged; }
-      kern::active::capture_a15(src, width, dst);
+      if (!lc.pre) late_lines(lc);
+      std::memcpy(dst, lc.px.data() + line * SCREEN_W, width * sizeof(u16));
       for (u32 k = 0; k < width; k += 128) cap_seg_[dst_bank * 512 + ((cap_idx + k) >> 7)].sum = cap_sum(dst + k);
+      filled = true;
     }
-    if (synced) { ++cap_late_filled_; any = true; }
+    if (filled) { ++cap_late_filled_; any = true; }
   }
   if (read_trap_bank_ >= 0 && !lines_in_flight()) release_read_trap();   // held for a capture now written
   return any;
+}
+
+// A late capture's lines with its own 3D frame (waited for), each as capture() would have written it. On the
+// emulation thread or the 2D worker: nothing here but the LateCap (all its lines drawn) and that frame's record.
+void Gpu::late_lines(LateCap& lc) {
+  const u32 size = (lc.cnt >> 20) & 3;
+  const u32 width = size == 0 ? 128 : 256, height = size == 0 ? 128 : 64 * size;
+  Renderer3D::FrameRef r = lc.ref;
+  r.allow_lag = false; r.out = nullptr;   // that frame's own record
+  nds_.gpu3d.renderer().sync_line(r, 0);
+  alignas(16) Pixel merged[SCREEN_W];
+  for (u32 line = 0; line < std::min<u32>(height, SCREEN_H); ++line) {
+    if (!lc.kind[line]) continue;
+    const Pixel* src = r.line(line);
+    if (lc.kind[line] == 1) { kern::active::split_merge_line(lc.w.data() + line * SCREEN_W, lc.u.data() + line * SCREEN_W, src, merged); src = merged; }
+    kern::active::capture_a15(src, width, lc.px.data() + line * SCREEN_W);
+  }
+  lc.pre = true;
+}
+
+// Line 0, after the join and begin_frame: the captures of the frames before go to the worker.
+void Gpu::late_prefill() {
+  static const bool on = !(std::getenv("DS_CAP_PRE") && std::getenv("DS_CAP_PRE")[0] == '0');
+  if (!on || late_inflight_ || lines_in_flight() || !worker_.running()) return;
+  bool due = false;
+  for (const LateCap& lc : late_) due = due || (lc.pending && lc.frame != late_seq_ && !lc.pre);
+  if (!due) return;
+  late_job_seq_ = late_seq_; late_job_ = true; late_inflight_ = true;
+  worker_.dispatch();
 }
 
 void Gpu::quiesce() {
@@ -1619,7 +1829,7 @@ void Gpu::quiesce() {
 }
 
 void Gpu::prepare_load() {
-  join_worker();
+  join_worker(); std::memset(a_n_, 0, sizeof a_n_); late_join();
   release_read_trap();
   disarm_trap();
   lazy_frame_ = false; per_line_[0] = per_line_[1] = true;
@@ -1670,7 +1880,7 @@ void Gpu::dma_copied(u32 src, u32 dst, u32 bytes) {
     // A late capture on its way out before the next frame's render: written with its own 3D frame now, and the
     // block copied again (Golden Sun: Dark Dawn moves every captured frame through main RAM).
     const bool refilled = (late_[0].pending || late_[1].pending) && late_fill(render_next_[0] >= SCREEN_H);
-    if (refilled) { cap_backoff_ = 600; ++cap_taken_dma_; }
+    if (refilled) { cap_stand_down(); ++cap_taken_dma_; }
     if (refilled && !nds_.dsi) {
       const u32 at = dst & (mem::Bus::MAIN_RAM_SIZE - 1);
       if (at + bytes <= mem::Bus::MAIN_RAM_SIZE)
@@ -1733,13 +1943,19 @@ void Gpu::split_capture_display(int e, u32 line) {
   const Engine2D& en = engine[e];
   const int scr = en.screen();
   SplitScreen& ss = split_cur_.s[scr];
-  u32* const row = split_fb_[scr].data() + line * SCREEN_W;
-  u32* const xy = split_xy_[scr].data() + line * SCREEN_W;
+  u32* const row = wp(scr).split_fb[scr].data() + line * SCREEN_W;
+  u32* const xy = wp(scr).split_xy[scr].data() + line * SCREEN_W;
   alignas(16) u32 refs[SCREEN_W];
   const u32 mode = e == 0 ? (en.dispcnt() >> 16) & 3 : (en.dispcnt() >> 16) & 1;
   bool have = false, vram = false;
+  const u32* whole = nullptr;
   if (screens_on_ && !ss.live) {
-    if (mode == 1) have = en.cap_refs(refs);
+    if (mode == 1) {
+      // One opaque layer over the whole line, no effect: its references as they are, and every pixel of it is
+      // shown as it is (no need to look).
+      whole = en.cap_refs_whole();
+      if (whole) have = true; else have = en.cap_refs(refs);
+    }
     else if (e == 0 && mode == 2) {
       const u32 bank = (en.dispcnt() >> 18) & 3;
       if (lcdc_mask_render_ & (1u << bank)) {
@@ -1749,6 +1965,7 @@ void Gpu::split_capture_display(int e, u32 line) {
     }
   }
   if (!have) { std::memset(row, 0, SCREEN_W * sizeof(u32)); return; }
+  const u32* const rf = whole ? whole : refs;
   const VramMap& vm = nds_.bus.vram_map();
   const Pixel* const out = en.output();
   const u32 mreg = en.master_bright();
@@ -1763,15 +1980,16 @@ void Gpu::split_capture_display(int e, u32 line) {
   // capture's, less the pixels that are not on top or not shown as they are.
   {
     u32 x0 = 0;
-    while (x0 < SCREEN_W && !refs[x0]) ++x0;
+    while (x0 < SCREEN_W && !rf[x0]) ++x0;
     if (x0 == SCREEN_W) { std::memset(row, 0, SCREEN_W * sizeof(u32)); return; }
-    const u32 rb = refs[x0] - x0;   // the reference pixel 0 has, or would have
-    u32 off = 0;
-    for (u32 x = 0; x < SCREEN_W; ++x) off |= refs[x] ? refs[x] ^ (rb + x) : 0;
+    const u32 rb = rf[x0] - x0;   // the reference pixel 0 has, or would have
+    u32 off = 0, zero = 0;
+    for (u32 x = 0; x < SCREEN_W; ++x) { off |= rf[x] ? rf[x] ^ (rb + x) : 0; zero |= rf[x] == 0; }
+    const bool as_is = vram || (whole && !zero);   // every pixel is the capture's, on top and shown as it is
     const u32 b = (rb >> 16) & 7, idx = rb & 0xFFFF;
     const CapSeg& s0 = cap_seg_[b * 512 + (idx >> 7)];
     const CapSeg& s1 = cap_seg_[b * 512 + (((idx + 128) & 0xFFFF) >> 7)];
-    if (!off && !mb_on && !(idx & 0xFF) && s0.gen && s0.gen == s1.gen && s0.base == s1.base && s0.width == 256 && s1.width == 256 &&
+    if (!off && !(idx & 0xFF) && s0.gen && s0.gen == s1.gen && s0.base == s1.base && s0.width == 256 && s1.width == 256 &&
         s0.uniform == s1.uniform && s0.each == s1.each && ((idx - s0.base) & 0xFFFF) == line * 256 && (!ss.any || ss.ref.gpu_gen == s0.gen)) {
       const Renderer3D::FrameRef* const ref = ss.any ? &ss.ref : frame_of(s0.gen);
       const u16* const v = reinterpret_cast<const u16*>(vm.bank(Engine2D::cap_slot_bank(b))) + idx;
@@ -1781,13 +1999,22 @@ void Gpu::split_capture_display(int e, u32 line) {
         return;
       }
       const u32* const cw = cap_words_.data() + b * 65536 + idx;
-      const u32 uni = s0.uniform;
+      // The line's words: the capture's, PLAIN ones as FIXED under master brightness (PLAIN skips it). Then, but
+      // for a VRAM display, only where the captured pixel is on top and shown as it is. Loops without branches:
+      // this runs for every line of a screen showing a capture.
+      const u32 fixed = split3d::pack(0, split3d::FIXED, 16, 0) | split3d::Q15;
+      const u32 mbm = mb_on ? ~0u : 0u;
+      alignas(16) u32 wl[SCREEN_W];
+      if (s0.each) for (u32 x = 0; x < SCREEN_W; ++x) { const u32 w = cw[x]; const u32 p = (w != 0 && split3d::op_of(w) == split3d::PLAIN) ? mbm : 0u; wl[x] = (w & ~p) | (fixed & p); }
+      else { const u32 w0 = s0.uniform; const u32 w = mb_on && w0 && split3d::op_of(w0) == split3d::PLAIN ? fixed : w0; for (u32 x = 0; x < SCREEN_W; ++x) wl[x] = w; }
       u32 n = 0;
-      if (vram && !s0.each) { for (u32 x = 0; x < SCREEN_W; ++x) row[x] = uni; n = SCREEN_W; }
-      else if (vram) { for (u32 x = 0; x < SCREEN_W; ++x) { row[x] = cw[x]; n += cw[x] != 0; } }
-      else if (!s0.each) { for (u32 x = 0; x < SCREEN_W; ++x) { const u32 w = refs[x] && (out[x] & 0x00FFFFFF) == kern::direct_colour(v[x]) ? uni : 0; row[x] = w; n += w != 0; } }
-      else { for (u32 x = 0; x < SCREEN_W; ++x) { const u32 w = refs[x] && (out[x] & 0x00FFFFFF) == kern::direct_colour(v[x]) ? cw[x] : 0; row[x] = w; n += w != 0; } }
-      if (!vram && stat_on_) for (u32 x = 0; x < SCREEN_W; ++x) split_cap_effect_ += refs[x] && (s0.each ? cw[x] : uni) && (out[x] & 0x00FFFFFF) != kern::direct_colour(v[x]);
+      if (as_is) for (u32 x = 0; x < SCREEN_W; ++x) { row[x] = wl[x]; n += wl[x] != 0; }
+      else for (u32 x = 0; x < SCREEN_W; ++x) {
+        const u32 m = ((rf[x] != 0) & ((out[x] & 0x00FFFFFF) == kern::direct_colour(v[x]))) ? ~0u : 0u;
+        const u32 w = wl[x] & m;
+        row[x] = w; n += w != 0;
+      }
+      if (!as_is && stat_on_) for (u32 x = 0; x < SCREEN_W; ++x) split_cap_effect_ += rf[x] && wl[x] && (out[x] & 0x00FFFFFF) != kern::direct_colour(v[x]);
       if (n && !ss.any) { ss.any = true; ss.live = false; ss.ref = *ref; }
       split_cap_shown_ += n;
       return;
@@ -1797,7 +2024,7 @@ void Gpu::split_capture_display(int e, u32 line) {
   bool memo_ok = false;
   for (u32 x = 0; x < SCREEN_W; ++x) {
     row[x] = 0;
-    const u32 r = refs[x];
+    const u32 r = rf[x];
     if (!r) continue;
     const u32 b = (r >> 16) & 7, idx = r & 0xFFFF;
     const CapSeg& seg = cap_seg_[b * 512 + (idx >> 7)];
@@ -1828,7 +2055,7 @@ void Gpu::split_capture_display(int e, u32 line) {
 bool Gpu::split3d_screen(int screen, Split3DScreen* f) const {
   const SplitScreen& ss = split_done_.s[screen & 1];
   if (!ss.any) return false;
-  f->words = split_fb_[screen & 1].data(); f->coords = ss.coords ? split_xy_[screen & 1].data() : nullptr; f->lines = split_mb_[screen & 1];
+  f->words = fp(screen & 1).split_fb[screen & 1].data(); f->coords = ss.coords ? fp(screen & 1).split_xy[screen & 1].data() : nullptr; f->lines = fp(screen & 1).split_mb[screen & 1];
   f->gen = ss.ref.gpu_gen; f->live = ss.live; f->scrolled = ss.scrolled;
   return true;
 }
@@ -1836,7 +2063,7 @@ bool Gpu::split3d_screen(int screen, Split3DScreen* f) const {
 void Gpu::merge_split3d(int screen, u32* dst) {
   screen &= 1;
   const SplitScreen& f = split_done_.s[screen];
-  const u32* const fb = fb_[screen].data();
+  const u32* const fb = fp(screen).fb[screen].data();
   if (dst != fb) std::memcpy(dst, fb, SCREEN_W * SCREEN_H * sizeof(u32));
   if (!f.any) return;
   Renderer3D::FrameRef r = f.ref;
@@ -1845,10 +2072,10 @@ void Gpu::merge_split3d(int screen, u32* dst) {
   alignas(16) Pixel merged[SCREEN_W];
   alignas(16) u32 shown[SCREEN_W];
   for (u32 y = 0; y < SCREEN_H; ++y) {
-    const u32* const w = split_fb_[screen].data() + y * SCREEN_W;
-    const u32* const xy = split_xy_[screen].data() + y * SCREEN_W;
+    const u32* const w = fp(screen).split_fb[screen].data() + y * SCREEN_W;
+    const u32* const xy = fp(screen).split_xy[screen].data() + y * SCREEN_W;
     const u32* const t = r.line(y);
-    const s32 xofs = static_cast<s32>(split_mb_[screen][y] << 3) >> 23;   // BG0's X offset on this line (bits 20-28, signed)
+    const s32 xofs = static_cast<s32>(fp(screen).split_mb[screen][y] << 3) >> 23;   // BG0's X offset on this line (bits 20-28, signed)
     u64 on[4] = {};
     for (u32 x = 0; x < SCREEN_W; ++x) {
       merged[x] = 0;
@@ -1860,7 +2087,7 @@ void Gpu::merge_split3d(int screen, u32* dst) {
       on[x >> 6] |= u64{1} << (x & 63);
     }
     if (!(on[0] | on[1] | on[2] | on[3])) continue;
-    kern::active::output_line(merged, split_reg_[screen][y], shown);   // as the output stage shows a composed line
+    kern::active::output_line(merged, fp(screen).split_reg[screen][y], shown);   // as the output stage shows a composed line
     u32* const o = dst + y * SCREEN_W;
     for (u32 x = 0; x < SCREEN_W; ++x) if ((on[x >> 6] >> (x & 63)) & 1) o[x] = shown[x];
   }
@@ -1869,7 +2096,7 @@ void Gpu::merge_split3d(int screen, u32* dst) {
 bool Gpu::merge_split3d_scaled(int screen, u32 n, u32* dst) {
   screen &= 1;
   const SplitScreen& f = split_done_.s[screen];
-  const u32* const fb = fb_[screen].data();
+  const u32* const fb = fp(screen).fb[screen].data();
   const u32 W = SCREEN_W * n;
   const u32* fine = nullptr;
   if (f.any) {
@@ -1886,9 +2113,9 @@ bool Gpu::merge_split3d_scaled(int screen, u32 n, u32* dst) {
   alignas(16) Pixel merged[SCREEN_W];
   alignas(16) u32 shown[SCREEN_W];
   for (u32 y = 0; y < SCREEN_H; ++y) {
-    const u32* const w = split_fb_[screen].data() + y * SCREEN_W;
-    const u32* const xy = split_xy_[screen].data() + y * SCREEN_W;
-    const s32 xofs = static_cast<s32>(split_mb_[screen][y] << 3) >> 23;   // BG0's X offset on this line, in DS pixels
+    const u32* const w = fp(screen).split_fb[screen].data() + y * SCREEN_W;
+    const u32* const xy = fp(screen).split_xy[screen].data() + y * SCREEN_W;
+    const s32 xofs = static_cast<s32>(fp(screen).split_mb[screen][y] << 3) >> 23;   // BG0's X offset on this line, in DS pixels
     for (u32 sy = 0; sy < n; ++sy)
       for (u32 sx = 0; sx < n; ++sx) {
         u64 on[4] = {};
@@ -1906,7 +2133,7 @@ bool Gpu::merge_split3d_scaled(int screen, u32 n, u32* dst) {
           on[x >> 6] |= u64{1} << (x & 63);
         }
         if (!(on[0] | on[1] | on[2] | on[3])) continue;
-        kern::active::output_line(merged, split_reg_[screen][y], shown);
+        kern::active::output_line(merged, fp(screen).split_reg[screen][y], shown);
         u32* const o = dst + (y * n + sy) * W + sx;
         for (u32 x = 0; x < SCREEN_W; ++x) if ((on[x >> 6] >> (x & 63)) & 1) o[x * n] = shown[x];
       }
@@ -1919,15 +2146,15 @@ void Gpu::resolve_split3d() {
   for (int s = 0; s < 2; ++s) {
     SplitScreen& ss = split_done_.s[s];
     if (!ss.any) continue;
-    if (ss.live) { merge_split3d(s, fb_[s].data()); ++split_resolved_; }
+    if (ss.live) { merge_split3d(s, fp(s).fb[s].data()); ++split_resolved_; a_n_[a_cur_][s] = 0; }   // that screen's lines are not engine A's any more
     else if (stat) {   // a capture shown again: at 1x the merge must give the framebuffer's own pixels
       std::vector<u32> m(SCREEN_W * SCREEN_H);
       merge_split3d(s, m.data());
       for (u32 i = 0; i < SCREEN_W * SCREEN_H; ++i) {
-        if (!split_fb_[s][i]) continue;
+        if (!fp(s).split_fb[s][i]) continue;
         ++split_cap_checked_;
-        if (m[i] != fb_[s][i] && split_cap_bad_++ < 16)
-          std::fprintf(stderr, "split3d: frame %llu screen %d pixel %u,%u: the capture's merge gives %06x, the screen shows %06x (word %08x)\n", static_cast<unsigned long long>(nds_.frame_count), s, i % SCREEN_W, i / SCREEN_W, m[i] & 0xFFFFFF, fb_[s][i] & 0xFFFFFF, split_fb_[s][i]);
+        if (m[i] != fp(s).fb[s][i] && split_cap_bad_++ < 16)
+          std::fprintf(stderr, "split3d: frame %llu screen %d pixel %u,%u: the capture's merge gives %06x, the screen shows %06x (word %08x)\n", static_cast<unsigned long long>(nds_.frame_count), s, i % SCREEN_W, i / SCREEN_W, m[i] & 0xFFFFFF, fp(s).fb[s][i] & 0xFFFFFF, fp(s).split_fb[s][i]);
       }
     }
     ss.any = false;
@@ -1937,7 +2164,12 @@ void Gpu::resolve_split3d() {
 template <class S> void Gpu::sync_state(S& s) {
   s.begin("GPU ");
   s.fields(line_, hblank_done_, frame_begun_, screens_on_, master_bright_g_, capcnt_, capture_on_, fifo_, fifo_rd_, fifo_wr_, fifo_line_, run_fifo_);
-  s.fields(fb_);   // what the display shows until the next frame (and the thumbnail)
+  if constexpr (S::reading) {
+    page_[0] = page_[1] = front_[0] = front_[1] = 0;
+    if (line_ >= SCANLINES_PER_FRAME) { s.fail("scanline"); return; }
+    fifo_rd_ &= 0xF; fifo_wr_ &= 0xE;   // display FIFO positions: the write side steps by two
+  }
+  s.fields(fp(0).fb[0], fp(1).fb[1]);   // what the display shows until the next frame (and the thumbnail)
   s.end();
   engine[0].sync_state(s);
   engine[1].sync_state(s);

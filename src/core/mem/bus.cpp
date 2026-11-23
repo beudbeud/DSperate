@@ -11,6 +11,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 
@@ -148,7 +149,7 @@ void Bus::update_wifi_timings() {
 
 void Bus::update_gba_slot_timings() {
   // Only bits 0-4 and 7 reach the slot timings (5-6 are the PHI output).
-  const u16 ex = nds_.io.exmemcnt & 0x9F;
+  const u16 ex = nds_.io.exmemcnt_slot2() & 0x9F;
   if (gba_slot_applied_ == ex) return;
   gba_slot_applied_ = ex;
   prof::add(prof::C_BUS_GBA_TIMING, 1);
@@ -227,6 +228,11 @@ void Bus::update_main_ram() {
 #endif
 }
 
+// DS_BIOS7_PROT=1: the DS ARM7 BIOS answers reads by where they come from, as
+// the hardware does. Off by default: its own reads (the SWI table, the sound
+// tables) then leave the recompilers' fast path, 0.06-0.19 ms a frame on the
+// RG DS Plus (2026-11-21), and no game is known to need it.
+bool Bus::bios7_protect = [] { const char* e = std::getenv("DS_BIOS7_PROT"); return e && e[0] == '1'; }();
 // DS: 4 KB ARM9 image mirrored over the top 64 KB, 16 KB ARM7 image at 0.
 // DSi: 64 KB images unless SCFG_BIOS switched a CPU back to its DS image;
 // hidden upper halves read as all ones via the slow path.
@@ -243,9 +249,15 @@ void Bus::update_bios_map() {
     map_page_aligned(pt9, 0xFFFF0000, BIOS9_SIZE, bios9.get(), RO, 0xFFFFFFFFu - 0xFFF);
     pt9.map(0xFFFFF000, 0x1000, bios9.get(), RO);
   }
-  // DSi ARM7 BIOS: left unmapped so every access goes through io_read, which
-  // applies the BIOS protection rules.
-  if (!(nds_.dsi && !(scfg_bios & 0x0200))) pt7.map(0x00000000, BIOS7_SIZE, bios7.get(), RO);
+  // DSi ARM7 BIOS, and the DS one under bios7_protect: left unmapped so every
+  // data read goes through io_read, which applies the BIOS protection rules;
+  // code is fetched through Bus::fetch.
+  if (!bios7_protect && !(nds_.dsi && !(scfg_bios & 0x0200))) pt7.map(0x00000000, BIOS7_SIZE, bios7.get(), RO);
+#if DSPERATE_JIT
+  // The DSi's switch to the DS BIOS images puts other code at the same addresses.
+  jit::remapped(nds_.cpu(Cpu::ARM9), 0xFFFF0000, 0xFFFFFFFF);
+  jit::remapped(nds_.cpu(Cpu::ARM7), 0x00000000, 0x0000FFFF);
+#endif
 }
 
 void Bus::update_vram_timings() {
@@ -339,6 +351,10 @@ void Bus::apply_wram(bool nwram, bool windows_only) {
     }
     wram_key_[c] = key;
     std::memcpy(wram_win_[c], win, sizeof win);
+#if DSPERATE_JIT
+    // WRAMCNT or a DSi window moved: code translated from 03xxxxxx may be other bytes now.
+    jit::remapped(nds_.cpu(c ? Cpu::ARM7 : Cpu::ARM9), 0x03000000, 0x03FFFFFF);
+#endif
   }
 }
 
@@ -520,6 +536,11 @@ void Bus::update_vram() {
   }
   nds_.gpu.vram_remap_end(trapped);
   if (watch_on && (watch_addr >> 24) == 0x06) { pt9.map_mmio(watch_addr & ~0x7FFu, 0x800); pt7.map_mmio(watch_addr & ~0x7FFu, 0x800); }
+#if DSPERATE_JIT
+  // Code run from VRAM (the ARM7's work-RAM banks) and a bank mapped elsewhere.
+  jit::remapped(nds_.cpu(Cpu::ARM9), 0x06000000, 0x06FFFFFF);
+  jit::remapped(nds_.cpu(Cpu::ARM7), 0x06000000, 0x06FFFFFF);
+#endif
 }
 
 // Slow-path VRAM access for blocks with overlapping banks (and LCDC gaps).
@@ -597,7 +618,7 @@ void Bus::update_tcm(CpuContext& cpu, bool force) {
   if (watch_on) pt.map_mmio(watch_addr & ~0x7FFu, 0x800);
   const u32 ctl = cpu.cp15_control;
   if (ctl & (1u << 16)) {                                       // DTCM enabled
-    const u32 base = cpu.cp15_dtcm & 0xFFFFF000;
+    const u32 base = cpu.dtcm_base;   // aligned to the window's size, as the timing table and melonDS have it
     u32 size = 512u << ((cpu.cp15_dtcm >> 1) & 0x1F);
     if (size < DTCM_SIZE) size = DTCM_SIZE;
     for (u32 off = 0; off < size; off += DTCM_SIZE) {
@@ -640,6 +661,14 @@ u32 Bus::io_read(Cpu cpu, u32 addr, u32 width) {
     return v;
   }
   if ((addr & 0xFF000000) == 0x04000000) return nds_.io.read(cpu, addr, width);
+  // The DS ARM7 BIOS reads as all ones to code outside it, and below BIOSPROT
+  // to code above it (melonDS NDS::ARM7Read). r15 is the interpreter's, and
+  // the recompilers' on a slow-path load.
+  if (bios7_code(cpu, addr)) {
+    const u32 pc = nds_.cpu(cpu).hot.regs[15], prot = nds_.io.arm7_bios_prot;
+    if (pc >= BIOS7_SIZE || (addr < prot && pc >= prot)) return width == 32 ? 0xFFFFFFFFu : width == 16 ? 0xFFFFu : 0xFFu;
+    u32 v = 0; std::memcpy(&v, bios7.get() + (addr & ~(width / 8 - 1)), width / 8); return v;
+  }
   // DSi: BIOS halves SCFG_BIOS hides read as all ones on both CPUs.
   if (nds_.dsi && (cpu == Cpu::ARM9 ? addr >= 0xFFFF0000 : addr < 0x00010000)) {
     const u32 ones = width == 32 ? 0xFFFFFFFFu : width == 16 ? 0xFFFFu : 0xFFu;
@@ -681,7 +710,7 @@ u32 Bus::slot2_read(Cpu cpu, u32 addr, u32 width) {
     if (width == 32) v |= rd(addr + 2) << 16 | rd(addr + 3) << 24;
   } else {
     static constexpr u16 decay[4] = {0xFE08, 0x0000, 0x0000, 0xFFFF};   // by the ROM's first-access wait (EXMEMCNT bits 2-3)
-    const u16 open = decay[(nds_.io.exmemcnt >> 2) & 3];
+    const u16 open = decay[(nds_.io.exmemcnt_slot2() >> 2) & 3];
     auto rd = [&](u32 a) -> u32 { return dev ? dev->rom_read16(a) : (((a >> 1) & 0xFFFF) | open); };
     v = width == 8 ? ((addr & 1) ? rd(addr - 1) >> 8 : rd(addr) & 0xFF) : rd(addr);
     if (width == 32) v |= rd(addr + 2) << 16;
@@ -855,7 +884,13 @@ u32 Bus::read32(Cpu cpu, u32 addr) { return io_read(cpu, addr, 32); }
 void Bus::write8 (Cpu cpu, u32 addr, u8  v) { io_write(cpu, addr, 8, v); }
 void Bus::write16(Cpu cpu, u32 addr, u16 v) { io_write(cpu, addr, 16, v); }
 void Bus::write32(Cpu cpu, u32 addr, u32 v) { io_write(cpu, addr, 32, v); }
+bool Bus::bios7_code(Cpu cpu, u32 addr) const {
+  return bios7_protect && cpu == Cpu::ARM7 && addr < BIOS7_SIZE && (!nds_.dsi || (nds_.io.dsi.scfg_bios & 0x0200));
+}
 u32 Bus::fetch(Cpu cpu, u32 addr, u32 width) {
+  if (bios7_code(cpu, addr)) {
+    u32 v = 0; std::memcpy(&v, bios7.get() + (addr & ~(width / 8 - 1)), width / 8); return v;
+  }
   if (nds_.dsi && cpu == Cpu::ARM7 && addr < 0x00010000 && !(nds_.io.dsi.scfg_bios & 0x0200)) {
     if (addr >= 0x8000 && (nds_.io.dsi.scfg_bios & 0x0100)) return width == 32 ? 0xFFFFFFFFu : 0xFFFFu;
     u32 v = 0; std::memcpy(&v, bios7i.get() + (addr & 0xFFFF & ~(width / 8 - 1)), width / 8); return v;

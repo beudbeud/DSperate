@@ -20,6 +20,7 @@ const Choice kSkipMode[] = {{"adaptive", N_("ADAPTIVE")}, {"fixed", N_("FIXED")}
 // Panel-typical rates, plus the console's own (auto, the default) and no limit.
 const Choice kLimiter[] = {{"auto", N_("CONSOLE (59.8)")}, {"30", "30"}, {"60", "60"}, {"120", "120"},
                            {"144", "144"}, {"240", "240"}, {"off", N_("UNLIMITED")}};
+const Choice kTiming[]   = {{"fast", N_("FAST")}, {"exact", N_("EXACT")}, {"turbo", N_("TURBO")}};
 const Choice kIntScale[] = {{"off", N_("OFF")}, {"under", N_("UNDER")}, {"over", N_("OVER")}};
 const Choice kSeam[]     = {{"dark", N_("DARK")}, {"blend", N_("BLEND")}, {"blend_linear", N_("BLEND LINEAR")}};
 const Choice kChunky[]   = {{"false", N_("OFF")}, {"mean", N_("DEFAULT")}, {"extreme", N_("ADAPTIVE")},
@@ -47,6 +48,9 @@ const Choice kLanguage[] = {{"0", N_("JAPANESE")}, {"1", N_("ENGLISH")}, {"2", N
                             {"3", N_("GERMAN")}, {"4", N_("ITALIAN")}, {"5", N_("SPANISH")}};
 const Choice kCheck[]    = {{"false", "[ ]"}, {"true", "[X]"}};
 const Choice kRumble[]   = {{"auto", N_("AUTO")}, {"on", N_("ON")}, {"off", N_("OFF")}};
+const Choice kMotion[]   = {{"auto", N_("AUTO")}, {"retail", N_("MOTION PACK")}, {"homebrew", N_("MOTION CARD")}, {"off", N_("OFF")}};
+const Choice kMotionSrc[] = {{"auto", N_("AUTO")}, {"pad", N_("CONTROLLER")}, {"sensor", N_("SENSOR")}, {"stick", N_("STICK")}};
+const Choice kMotionStick[] = {{"right", N_("RIGHT")}, {"left", N_("LEFT")}};
 const Choice kAnalog[]   = {{"auto", N_("AUTO")}, {"off", N_("OFF")}, {"left", N_("LEFT STICK")}, {"right", N_("RIGHT STICK")}, {"dual", N_("TWO STICKS")}};
 const Choice kAnalogLayout[] = {{"auto", N_("AUTO")}, {"packed", N_("PACKED")}, {"extended", N_("EXTENDED")}};
 const Choice kLayout[]   = {{"vertical", N_("VERTICAL")}, {"horizontal", N_("HORIZONTAL")}, {"single", N_("SINGLE")},
@@ -58,6 +62,13 @@ std::array<Choice, kMaxUiLanguages> kUiLanguages = [] {
   std::array<Choice, kMaxUiLanguages> a{};
   a.fill(Choice{"", ""});
   a[0] = Choice{"auto", N_("AUTO")};
+  return a;
+}();
+// Filled by set_camera_images, as the languages are.
+std::array<Choice, kMaxCameraImages> kCameraImages = [] {
+  std::array<Choice, kMaxCameraImages> a{};
+  a.fill(Choice{"", ""});
+  a[0] = Choice{"", N_("TEST PATTERN")};
   return a;
 }();
 const Choice kCorner[]   = {{"tl", N_("TOP LEFT")}, {"tr", N_("TOP RIGHT")}, {"bl", N_("BOTTOM LEFT")}, {"br", N_("BOTTOM RIGHT")}};
@@ -111,10 +122,15 @@ const Setting kEmuSettings[] = {
   number("audio.buffer_size", N_("AUDIO BUFFER"), 20, 200, 10, "auto", FlagLive, Dep::None,
          N_("SOUND HELD AHEAD. LOWER IS LESS DELAY, LESS SLACK BEFORE A LATE FRAME IS HEARD"),
          "auto", N_("AUTO"), " MS"),
+  // Turbo is not the console's speed: the host warns once a session when it is picked here (main.cpp).
+  pick("emu.timing", N_("CPU TIMING"), kTiming, 3, "fast", FlagRestart, Dep::None,
+       N_("EXACT IS THE CONSOLE'S, AND SLOWER TO RUN. TURBO GIVES GAMES MORE CPU: SMOOTHER, MAY BREAK SOME")),
   boolean("emu.autosave", N_("AUTOSAVE ON QUIT"), "false", FlagLive, Dep::None,
           N_("SAVE A STATE WHEN THE EMULATOR EXITS, TO RESUME FROM")),
   boolean("emu.autoload", N_("AUTOLOAD ON START"), "false", FlagRestart, Dep::None,
           N_("WHEN A GAME STARTS, RESUME FROM ITS AUTOSAVED STATE IF THERE IS ONE")),
+  boolean("emu.dsi_enhanced", N_("DSI ENHANCED GAMES"), "false", FlagRestart, Dep::DsiFirmware,
+          N_("RUN DSI-ENHANCED GAME CARDS AS A DSI. NEEDS THE DSI BIOS, AND RUNS HEAVIER")),
   boolean("emu.dsi_hide_installed", N_("HIDE NAND DSIWARE"), "false", FlagRestart, Dep::None,
           N_("DSI MENU: HIDE THE NAND DUMP'S OWN TITLES. THE DUMP IS NOT CHANGED")),
   boolean("emu.dsi_nand_shortcuts", N_("DSI NAND LINKS"), "false", FlagLive, Dep::ShortcutsPath,
@@ -127,6 +143,13 @@ const Setting kEmuSettings[] = {
        N_("IN SLOT 2 WHEN NO GBA GAME IS. AUTO: WHEN THE CONTROLLER CAN RUMBLE")),
   number("slot2.rumble_strength", N_("RUMBLE STRENGTH"), 10, 100, 10, "100", FlagLive, Dep::RumblePak,
          N_("HOW HARD THE MOTOR RUNS WHEN THE GAME RUMBLES"), nullptr, nullptr, "%"),
+  // TRANSLATORS: the slot-2 motion accessory (Tony Hawk's Motion came with one).
+  pick("slot2.motion", N_("MOTION PACK"), kMotion, 4, "auto", FlagRestart, Dep::None,
+       N_("A TILT SENSOR IN SLOT 2. AUTO: FOR THE GAME THAT NEEDS IT")),
+  pick("slot2.motion_source", N_("TILT FROM"), kMotionSrc, 4, "auto", FlagRestart, Dep::None,
+       N_("THE CONTROLLER'S OR HANDHELD'S OWN SENSOR WHERE THERE IS ONE, ELSE A STICK")),
+  pick("slot2.motion_stick", N_("TILT STICK"), kMotionStick, 2, "right", FlagLive, Dep::None,
+       N_("THE STICK THAT TILTS WHEN THERE IS NO SENSOR. THE PEN LETS GO OF IT MEANWHILE")),
   number("slot2.solar", N_("SOLAR SENSOR"), 0, 10, 1, "5", FlagLive, Dep::SolarSensor,
          N_("THE SUNLIGHT A BOKTAI CARTRIDGE SEES: 0 DARK, 10 FULL SUN")),
   pick("net.mode", N_("NETWORK FEATURES"), kNetMode, 5, "off", FlagLive, Dep::Net,
@@ -230,8 +253,21 @@ const Setting kUserSettings[] = {
          N_("NOT CHECKED AGAINST THE MONTH, AS THE CONSOLE DOES NOT EITHER")),
   pick("user.language", N_("LANGUAGE"), kLanguage, 6, "1", FlagRestart, Dep::None,
        N_("THE LANGUAGE MULTI-LANGUAGE GAMES START IN")),
+  pick("emu.dsi_camera_image", N_("DSI CAMERA PICTURE"), kCameraImages.data(), kMaxCameraImages, "", FlagLive | FlagVerbatim, Dep::DsiFirmware,
+       N_("WHAT THE DSI'S CAMERAS SEE: A PICTURE FROM PATHS.DSI_PHOTOS, OR COLOUR BARS")),
   end(),
 };
+
+void set_camera_images(const std::vector<std::string>& names) {
+  static std::vector<std::string> kept;
+  kept = names;
+  for (int i = 1; i < kMaxCameraImages; ++i) kCameraImages[i] = Choice{"", ""};
+  int n = 1;
+  for (const std::string& name : kept) {
+    if (n == kMaxCameraImages) break;
+    kCameraImages[n++] = Choice{name.c_str(), name.c_str()};
+  }
+}
 
 void set_ui_languages(const std::vector<UiLanguage>& languages) {
   // Owned here so the table's pointers stay valid; set once, at startup.
@@ -311,8 +347,9 @@ std::string display_value(const Setting& s, const std::string& value) {
     const int i = choice_index(s, v);
     if (i < 0) return v;   // unknown value: show as-is, not silently remapped
     const char* label = s.choices[i].label;
-    // Language names are their own; only the language row's AUTO is translated.
-    if ((s.flags & FlagVerbatim) && v != "auto") return label;
+    // Language names and file names are their own; only the row's first
+    // choice (AUTO, TEST PATTERN) is translated.
+    if ((s.flags & FlagVerbatim) && i != 0) return label;
     // A choice marked NC_(key, ...) has the setting's key as its context.
     const char* in_context = i18n::trc(s.key, label);
     return in_context != label ? in_context : i18n::tr(label);

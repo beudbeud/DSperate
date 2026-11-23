@@ -39,9 +39,20 @@ add_executable(test_sleep sleep_test.cpp)
 target_link_libraries(test_sleep PRIVATE dsperate_core)
 add_test(NAME sleep COMMAND test_sleep)
 
+add_executable(test_dsp_aac dsp_aac_test.cpp)
+target_link_libraries(test_dsp_aac PRIVATE dsperate_core)
+add_test(NAME dsp_aac COMMAND test_dsp_aac)
 add_executable(test_cart_save cart_save_test.cpp)
 target_link_libraries(test_cart_save PRIVATE dsperate_core)
 add_test(NAME cart_save COMMAND test_cart_save)
+
+add_executable(test_state_load state_load_test.cpp)
+target_link_libraries(test_state_load PRIVATE dsperate_core)
+add_test(NAME state_load COMMAND test_state_load)
+
+add_executable(test_state_roundtrip state_roundtrip_test.cpp)
+target_link_libraries(test_state_roundtrip PRIVATE dsperate_core)
+add_test(NAME state_roundtrip COMMAND test_state_roundtrip)
 
 add_executable(test_slot2 slot2_test.cpp)
 target_link_libraries(test_slot2 PRIVATE dsperate_core)
@@ -54,6 +65,7 @@ add_test(NAME gpu3d COMMAND test_gpu3d)
 add_executable(test_fastmem fastmem_test.cpp)
 target_link_libraries(test_fastmem PRIVATE dsperate_core)
 add_test(NAME fastmem COMMAND test_fastmem)
+set_tests_properties(fastmem PROPERTIES SKIP_RETURN_CODE 77)   # no shared memory on the host: reported as skipped
 
 add_executable(test_div64 div64_test.cpp)
 target_link_libraries(test_div64 PRIVATE dsperate_core)
