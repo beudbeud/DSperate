@@ -618,7 +618,10 @@ bool NDS::save_state(state::Writer& w, std::string& err) {
 size_t NDS::state_size_max(std::string& err) {
   state::Writer w;
   if (!save_state(w, err)) return 0;
-  return w.data().size() + gpu::Gpu3D::state_lists_max();
+  // What can still grow: a save chip not detected yet (the largest detect_release picks), and
+  // ponytail: 1 MiB for the cheat journal and a DSP program's state; past it a save state is refused, not cut.
+  const size_t chip = cart && cart->save_type() == cart::SaveType::Detect ? 524288 : 0;
+  return w.data().size() + gpu::Gpu3D::state_lists_max() + chip + (size_t{1} << 20);
 }
 
 // A load that fails once the machine is being overwritten puts back the

@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <string>
 #include <vector>
@@ -156,6 +157,24 @@ int main(int argc, char** argv) {
     CHECK(!c.retro_unserialize(bad.data(), bad.size()));
     CHECK(c.retro_unserialize(st.data(), st.size()));
     c.retro_run();
+  }
+
+  { // Loading a state is not the game saving: quitting leaves the save file as it was.
+    c.retro_unload_game();
+    const std::string sav = dir + "/blank.sav";
+    const auto put = [&](char v) { std::ofstream(sav, std::ios::binary).write(std::string(512, v).data(), 512); };
+    put('\x11');
+    CHECK(c.retro_load_game(&gi));
+    std::vector<unsigned char> st(c.retro_serialize_size());
+    CHECK(c.retro_serialize(st.data(), st.size()));
+    c.retro_unload_game();
+    put('\x22');
+    CHECK(c.retro_load_game(&gi));
+    CHECK(c.retro_unserialize(st.data(), st.size()));
+    c.retro_unload_game();
+    std::ifstream in(sav, std::ios::binary);
+    CHECK(std::string(std::istreambuf_iterator<char>(in), {}) == std::string(512, '\x22'));
+    CHECK(c.retro_load_game(&gi));
   }
 
   c.retro_unload_game(); c.retro_deinit();

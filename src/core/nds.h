@@ -172,7 +172,8 @@ struct NDS {
   bool save_state(state::Writer& w, std::string& err);
   bool load_state(state::Reader& r, std::string& err);
   // A size no save state of this session exceeds (a DSi NAND's changes aside):
-  // the state now, plus the 3D lists at their hardware maximum. 0 with `err`
+  // the state now, plus the 3D lists at their hardware maximum and room for
+  // what else can grow in a session. 0 with `err`
   // when no state can be taken here.
   size_t state_size_max(std::string& err);
   bool load_state_into(state::Reader& r, std::string& err, state::Writer* undo, bool& began);   // load_state's body

@@ -10,8 +10,10 @@
 #include "libretro.h"
 #include "core/nds.h"
 #include "core/cheat/database.h"
+#include "core/cpu/timing_mode.h"
 #include "core/input/input_log.h"
 #include "core/io/dsi_title_install.h"
+#include "core/safe_file.h"
 #include "core/state/state.h"
 #include "frontend/video/layout.h"
 #include "frontend/video/smooth2d.h"
@@ -118,7 +120,7 @@ retro_core_option_v2_definition DEFS[] = {
    {{"enabled", "On"}, {"disabled", "Off"}, {nullptr, nullptr}}, "enabled"},
   {"dsperate_boot", "System > Boot", "Boot", "Direct: jump into the game. Firmware: boot the DS menu with the cart inserted; needs bios9.bin, bios7.bin and firmware.bin in the system directory.", nullptr, "system",
    {{"direct", "Direct boot"}, {"firmware", "Firmware (DS menu)"}, {nullptr, nullptr}}, "direct"},
-  {"dsperate_console", "System > Console", "Console", "Auto: DSi for DSiWare and DSi-enhanced carts when bios9i.bin and bios7i.bin are in the system directory, else DS. DSiWare is handed over as the launcher would, no NAND needed.", nullptr, "system",
+  {"dsperate_console", "System > Console", "Console", "Auto: DSi for DSiWare and DSi-only cards when bios9i.bin and bios7i.bin are in the system directory, else DS (DSi-enhanced cards run as DS games). DSi: every game as a DSi, heavier and experimental. DSiWare is handed over as the launcher would, no NAND needed.", nullptr, "system",
    {{"auto", "Auto"}, {"ds", "DS"}, {"dsi", "DSi"}, {nullptr, nullptr}}, "auto"},
   {"dsperate_language", "System > Language", "Language", "The console language games read from the firmware. Firmware: the dump's own setting, or English with the generated firmware.", nullptr, "system",
    {{"firmware", "Firmware setting"}, {"japanese", "Japanese"}, {"english", "English"}, {"french", "French"}, {"german", "German"}, {"italian", "Italian"}, {"spanish", "Spanish"}, {nullptr, nullptr}}, "firmware"},
@@ -273,13 +275,13 @@ std::vector<u8> slurp(const std::string& path) {
 }
 
 void write_save() {
-  if (!nds || !nds->cart || save_path.empty() || nds->cart->sram().empty()) return;
-  const std::string tmp = save_path + ".tmp";
-  FILE* f = std::fopen(tmp.c_str(), "wb");
-  if (!f) { log(RETRO_LOG_ERROR, "save: cannot write %s", tmp.c_str()); return; }
-  const bool ok = std::fwrite(nds->cart->sram().data(), 1, nds->cart->sram().size(), f) == nds->cart->sram().size();
-  std::fclose(f);
-  if (!ok || std::rename(tmp.c_str(), save_path.c_str()) != 0) { log(RETRO_LOG_ERROR, "save: cannot write %s", save_path.c_str()); return; }
+  // Only what the game wrote: a loaded state's save memory reaches the file once the game saves over it,
+  // and the file it replaces is then kept (Cart::sram_from_state).
+  if (!nds || !nds->cart || save_path.empty() || nds->cart->sram().empty() || !nds->cart->sram_dirty()) return;
+  const bool keep = nds->cart->sram_from_state();
+  std::string err;
+  if (!write_file_atomic(save_path, nds->cart->sram().data(), nds->cart->sram().size(), err, keep ? save_path + ".prestate.bak" : std::string())) { log(RETRO_LOG_ERROR, "save: %s", err.c_str()); return; }
+  nds->cart->clear_sram_from_state();
   nds->cart->clear_sram_dirty();
   save_writes_seen = nds->cart->sram_writes();
 }
@@ -411,7 +413,7 @@ RETRO_API unsigned retro_api_version() { return RETRO_API_VERSION; }
 RETRO_API void retro_get_system_info(retro_system_info* info) {
   *info = {};
   info->library_name = "DSperate";
-  info->library_version = "3.3.0";
+  info->library_version = "4.0.1";
   info->valid_extensions = "nds|dsi|srl|cia|zip";
   info->need_fullpath = true;    // load_rom takes a path (zips are unpacked to a disk cache)
   info->block_extract = true;    // the core reads zips itself; the frontend must not unpack them
@@ -466,9 +468,10 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
     }
     save_writes_seen = nds->cart->sram_writes();
     // DSi: a DSiWare title is handed over as the launcher would (no NAND
-    // needed); a DSi-enhanced cart runs the DSi machine in card mode.
+    // needed); a DSi-only card runs the DSi machine in card mode, and a
+    // DSi-enhanced one too when the Console option says DSi.
     const bool dsiware = io::file_is_dsiware(p);
-    const bool want_dsi = console == "dsi" || (console != "ds" && nds->bios_native_dsi && (dsiware || nds->cart->dsi_capable()));
+    const bool want_dsi = console == "dsi" || (console != "ds" && nds->bios_native_dsi && (dsiware || nds->cart->header().unit_code == 3));
     if (want_dsi && !nds->bios_native_dsi) log(RETRO_LOG_WARN, "DSi mode needs bios9i.bin and bios7i.bin in %s; running as a DS", sys.c_str());
     else if (want_dsi) {
       nds->set_dsi(true);
@@ -486,6 +489,9 @@ RETRO_API bool retro_load_game(const retro_game_info* game) {
   } else if (!nds->can_boot_firmware()) {
     log(RETRO_LOG_WARN, "no ROM and no real dumps: nothing boots");
   }
+  // A DSi session runs on the exact timing model; the next game gets the process's own back. Before the recompiler bakes it in.
+  static const std::string base_timing = timing_name();
+  set_timing(nds->dsi && !std::getenv("DS_TIMING") ? "exact" : base_timing.c_str());
   rebuild_cheats();
   carry.clear(); swapped = false;
 #if DSPERATE_JIT
