@@ -233,6 +233,25 @@ void Io::timer_schedule(Cpu cpu, int idx) {
   nds_.sched.schedule(id, t.start_time + cycles, timer_event, (static_cast<u32>(cpu) << 2) | idx);   // from the sample point, exact
 }
 
+// See mic_tim_streak_ (io.h).
+bool Io::mic_idle_gate(int idx) {
+  static const u32 every = [] {
+    const char* e = std::getenv("DS_MIC_IDLE");   // 0: every interrupt is delivered; N: one in N while the microphone is silent
+    if (!e) return MIC_IDLE_EVERY;
+    const int v = std::atoi(e);
+    return v >= 2 && v <= 255 ? static_cast<u32>(v) : 0u;
+  }();
+  if (!every || !g_fast_timing || nds_.dsi) return true;
+  if (mic_count_ != 0) { mic_tim_skip_[idx] = 0; mic_tim_irq_at_[idx] = nds_.sched.event_time(); return true; }   // input: full rate at once
+  if (mic_tim_skip_[idx]) { --mic_tim_skip_[idx]; return false; }
+  // Did the handler of this timer's last delivered interrupt read the microphone? A read shortly after it counts.
+  const bool sampled = mic_conv_new_ && mic_conv_at_ >= mic_tim_irq_at_[idx] && mic_conv_at_ - mic_tim_irq_at_[idx] < 8192;
+  if (sampled) { mic_conv_new_ = false; if (mic_tim_streak_[idx] < 255) ++mic_tim_streak_[idx]; } else mic_tim_streak_[idx] = 0;
+  mic_tim_irq_at_[idx] = nds_.sched.event_time();
+  if (mic_tim_streak_[idx] >= MIC_IDLE_STREAK) mic_tim_skip_[idx] = static_cast<u8>(every - 1);
+  return true;
+}
+
 void Io::timer_overflow(Cpu cpu, int idx) {
   Timer& t = cpu_io[ci(cpu)].timers[idx];
   t.counter = t.reload;
@@ -242,7 +261,7 @@ void Io::timer_overflow(Cpu cpu, int idx) {
   if (dbg && dbg_left > 0 && cpu == Cpu::ARM7) { --dbg_left;
     std::fprintf(stderr, "[state] arm7 timer%d overflow at %llu (now %llu) control %04x reload %04x\n", idx,
                  (unsigned long long)t.start_time, (unsigned long long)nds_.sched.now(), t.control, t.reload); }
-  if (t.control & 0x40) request_irq(cpu, IRQ_TIMER0 + idx);
+  if ((t.control & 0x40) && (cpu == Cpu::ARM9 || mic_idle_gate(idx))) request_irq(cpu, IRQ_TIMER0 + idx);
   if (idx < 3) {
     Timer& n = cpu_io[ci(cpu)].timers[idx + 1];
     if (n.running() && n.count_up()) {
@@ -531,6 +550,7 @@ void Io::set_mic(const s16* samples, size_t count) {
 // ADC would. Register 2 bit 0 (amplifier enable) not honoured.
 u16 Io::mic_sample() const {
   mic_used_ = true;
+  mic_conv_at_ = nds_.sched.now(); mic_conv_new_ = true;
   static const bool log = std::getenv("DS_MIC_LOG") != nullptr;
   if (log) {
     static u64 reads = 0, last_frame = 0; static int peak = 0;
@@ -566,6 +586,26 @@ void Io::update_key_irq() {
 
 void Io::spi_release() {
   spi_pm.hold = false; spi_fw.hold = false; spi_fw.addr = 0; spi_tsc.pos = 0; spi_tsc.dsi_pos = 0;
+}
+
+u32 Io::romctrl_read_poll(Cpu cpu) {
+  cart_catch_up();
+  const u32 v = cart.romctrl;
+  // Waiting for a word: a read transfer under way, no DRQ, the word clock lazy (no DMA event) and not stalled.
+  if ((v & 0xC0800000u) != 0x80000000u || cart.event_armed || cart.late || cart.transfer_pos >= cart.transfer_len || nds_.dsi) { cart_poll_streak_ = 0; return v; }
+  static const bool off = std::getenv("DS_CART_POLL_SKIP") && std::getenv("DS_CART_POLL_SKIP")[0] == '0';
+  if (++cart_poll_streak_ >= CART_POLL_STREAK && !off && nds_.sched.idle_skip_enabled()) {
+    CpuContext& c = nds_.cpu(cpu);
+    const u64 now = nds_.sched.now();
+    if (nds_.sched.running() == &c && c.hot.cycle_budget > 0 && cart.next_word_at > now) {
+      // ARM9 cycles until the word, in the poller's own cycles, capped at the slice (see spicnt_read_arm7).
+      const u64 rem9 = cart.next_word_at - now;
+      const u64 own = cpu == Cpu::ARM9 ? rem9 : (rem9 + 1) / 2;
+      const s32 charge = own > static_cast<u64>(c.hot.cycle_budget) ? c.hot.cycle_budget : static_cast<s32>(own);
+      c.hot.cycle_budget -= charge;
+    }
+  }
+  return v;
 }
 
 u16 Io::spicnt_read_arm7() {
@@ -1115,6 +1155,7 @@ bool Io::census_env_on() { return g_ioc.on; }
 u32 Io::read(Cpu cpu, u32 addr, u32 width) {
   if (prof::census && g_ioc.on) g_ioc.rd[cpu == Cpu::ARM9 ? 0 : 1][addr]++;
   if (cpu == Cpu::ARM7 && (addr & ~3u) != 0x040001C0) spi_poll_streak_ = 0;
+  if (addr != 0x040001A4 || width != 32) cart_poll_streak_ = 0;
   if (nds_.dsi && (addr & 0xFFFFF000) == 0x04004000) return dsi_read(cpu, addr, width);
   if (!io_unowned(addr - 0x04000000)) {
     if (cpu == Cpu::ARM9 && gpu::Gpu3D::owns_reg(addr)) return nds_.gpu3d.read(addr, width);
@@ -1128,6 +1169,7 @@ u32 Io::read(Cpu cpu, u32 addr, u32 width) {
 
 void Io::write(Cpu cpu, u32 addr, u32 width, u32 value) {
   if (prof::census && g_ioc.on) g_ioc.wr[cpu == Cpu::ARM9 ? 0 : 1][addr]++;
+  cart_poll_streak_ = 0;
   if ((addr & ~3u) == 0x04100010) {   // ROMDATA, write direction
     const u32 sh = 8 * (addr & 3);
     cart_write_data(value << sh, (width == 32 ? 0xFFFFFFFFu : width == 16 ? 0xFFFFu : 0xFFu) << sh);
@@ -1161,7 +1203,7 @@ Io::Special Io::read32_special(Cpu cpu, u32 addr) {
   case 0x82: return {c.ime, true};
   case 0x84: return {c.ie, true};
   case 0x85: return {c.if_, true};
-  case 0x69: cart_catch_up(); return {cart.romctrl, true};
+  case 0x69: return {romctrl_read_poll(cpu), true};
   case 0xa0: return {divcnt_read(), true};
   case 0xa4: return {static_cast<u32>(math.div_num), true};
   case 0xa5: return {static_cast<u32>(math.div_num >> 32), true};
@@ -1869,9 +1911,11 @@ void Io::reprice_clock9_store(u32 idx) {
   a9.data_cycles = a9.timing9[0x04004004 >> 12][4 + idx];
 }
 
+static bool debug_mbk() { static const bool on = std::getenv("DS_DEBUG_MBK") != nullptr; return on; }
+
 // One MBK1-5 byte: slot `slot` of bank A (0), B (1) or C (2).
 void Io::mbk_map_slot(int bank, int slot, u8 value) {
-  if (getenv("DS_DEBUG_MBK")) std::fprintf(stderr, "[mbk] slot %c[%d] = %02x  t=%llu\n", "ABC"[bank], slot, value, (unsigned long long)nds_.sched.now());
+  if (debug_mbk()) std::fprintf(stderr, "[mbk] slot %c[%d] = %02x  t=%llu\n", "ABC"[bank], slot, value, (unsigned long long)nds_.sched.now());
   value &= bank == 0 ? ~0x72 : ~0x60;
   const u32 prot_bit = bank == 0 ? slot : bank == 1 ? 8 + slot : 16 + slot;
   if (dsi.mbk[0][8] & (1u << prot_bit)) return;
@@ -1933,7 +1977,7 @@ void Io::mbk_map_range(Cpu cpu, int bank, u32 value) {
   u32& reg = dsi.mbk[ci(cpu)][5 + bank];
   if (reg == value) return;
   reg = value;
-  if (getenv("DS_DEBUG_MBK")) {
+  if (debug_mbk()) {
     const u32 start = bank == 0 ? 0x03000000 + (((value >> 4) & 0xFF) << 16) : 0x03000000 + (((value >> 3) & 0x1FF) << 15);
     const u32 end   = bank == 0 ? 0x03000000 + (((value >> 20) & 0x1FF) << 16) : 0x03000000 + (((value >> 19) & 0x3FF) << 15);
     std::fprintf(stderr, "[mbk] range %c cpu%d val %08x -> %08x-%08x size %u  t=%llu\n",

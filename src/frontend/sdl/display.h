@@ -73,7 +73,8 @@ public:
   // a dimmed grid applies from 1x instead. See grid_on().
   // `xrun_plain`: the nearest map before chunky rewrote it into pairs/cells.
   // `y_lo`/`y_hi`: rect rows inside the buffer; only cropped under integer overscale.
-  struct Target { u32* px; u32 pitch; u32 h; const u16* xrun; const u8* seam_w; const u16* lin_sx; const u8* lin_wx; bool grid; const u16* xrun_plain; u32 y_lo = 0, y_hi = 0; };
+  // plain: this screen is scaled nearest with no picture effects (video.small_screen_fx off on the smaller view).
+  struct Target { u32* px; u32 pitch; u32 h; const u16* xrun; const u8* seam_w; const u16* lin_sx; const u8* lin_wx; bool grid; const u16* xrun_plain; u32 y_lo = 0, y_hi = 0; bool plain = false; };
 
   bool scaling() const { return scaled_; }
   // Leave GPU present for scanline scaling (dual-window: when the other window
@@ -123,10 +124,21 @@ public:
   void set_seam_blend(u8 mode) { seam_blend_ = mode; }
   // Chunky is left plain on a view shown smaller than the screen (PiP inset, dominant secondary).
   bool chunky_on(int screen) const { return src_chunky_[screen]; }
-  void set_grid_strength(double s) { grid_strength_ = s; }   // 0..1; dimmed grid is an overlay, needs no seam-adjacent room
+  void set_grid_strength(double s) { grid_strength_ = s; }
+  // video.small_screen_fx: false shows the smaller of two screens (the PiP inset, a dominant layout's second
+  // screen) plain, nearest with no grid, seams, bilinear or chunky. Colour correction stays on both: it is the
+  // screens' colours, not an effect of the panel. No effect on the display-engine tier (one layer, one filter).
+  void set_small_screen_fx(bool on);
+  bool plain_screen(int screen) const {
+    if (small_fx_ || disp_) return false;
+    const View* me = nullptr; const View* other = nullptr;
+    for (int i = 0; i < nviews_; ++i) (views_[i].screen == screen ? me : other) = &views_[i];
+    return me && other && me->shown && other->shown && static_cast<long>(me->rect.w) * me->rect.h < static_cast<long>(other->rect.w) * other->rect.h;
+  }   // 0..1; dimmed grid is an overlay, needs no seam-adjacent room
   // Whether the LCD grid applies to `screen`'s view: panel cells, or >=2x
   // for the full grid and >=1x for a dimmed one (see Target::grid).
   bool grid_on(int screen) const {
+    if (plain_screen(screen)) return false;
     if (cells_[screen].x.cells) return true;
     const int need = grid_strength_ >= 1.0 ? 2 : 1;
     for (int i = 0; i < nviews_; ++i) if (views_[i].screen == screen) return views_[i].rect.w >= need * static_cast<int>(SCREEN_W);
@@ -266,6 +278,7 @@ private:
   void draw_renderer(const u32* const fb[SCREENS]);
   SDL_Texture*  tex_[SCREENS] = {nullptr, nullptr};
   View          views_[SCREENS] = {};
+  bool          small_fx_ = true;      // video.small_screen_fx
   int           nviews_ = SCREENS;
   int           only_screen_ = -1;
   bool          upper_panel_ = false;   // dual-window: this window is the upper panel
@@ -282,7 +295,8 @@ private:
   bool              scaled_ = false;
   int               rot_wanted_ = 0;      // set_rotation(); DS_ROTATE otherwise
   int               rot_ = 0;             // in effect on the scanline tiers
-  bool              turned_ = false;      // KMS under an SDL that reports the panel turned: rot_ is the panel's turn, pointer events come logical
+  bool              turned_ = false;      // KMS under an SDL that reports the panel turned: rot_ is SDL's turn plus the one asked for
+  int               ptr_rot_ = 0;         // under turned_, the turn asked for: the one between SDL's pointer frame and ours
   int               phys_w_ = 0, phys_h_ = 0;   // the presented buffer's size (scaled_w_/h_ are logical)
   std::vector<u32>  stage_;               // the logical frame under rotation
   u32*              phys_px_ = nullptr;   // the presented buffer this frame, under rotation

@@ -217,12 +217,16 @@ bool Display::open_disp(bool linear, bool vsync, int rot) {
 // only driver is Mali EGL over fbdev (H700 handhelds under BaseOS).
 bool Display::open_fbdev(bool vsync, int rot) {
   auto fo = std::make_unique<FbdevOut>();
+  if (gpu_wanted_) fo->set_bufs(FbdevOut::DEFAULT_BUFS + 1);
   if (!fo->open(win_, vsync)) return false;
   out_ = std::move(fo);
   scaled_ = true;
   rot_ = rot;
   layout();
   build_scale();
+  // The Vulkan present where fb0 is exported as a dma-buf (A133P disp2); no word where it is not (H700 Mali fb).
+  ScanoutOut::DmabufPlane p0;
+  if (out_->dmabuf_plane(0, p0) && try_gpu_present()) return true;
   std::fprintf(stderr, "video: fbdev scanout %dx%d, %s driver, scanline scaling, rot %d, vsync %s\n",
                out_->width(), out_->height(), SDL_GetCurrentVideoDriver(), rot_, vsync ? "on" : "off");
   return true;
@@ -242,11 +246,27 @@ bool Display::open_kms(int rot) {
   if (turned) {
     // SDL reports the panel turned and would turn its own GLES frames before scanout (the RGA rotate patches of
     // ArkOS and dArkMoss on portrait panels mounted landscape). This sink scans out past SDL, so the turn is ours:
-    // the rotation asked for if it is a quarter turn, else SDL's usual one, 270 (DS_ROTATE=90 for a panel
-    // mounted the other way). A half turn asked for on top of it makes 90.
+    // SDL's own (frontend::sdl_panel_turn: 270 on the stock patch, 90 where the board boots fbcon=rotate:1, as
+    // the XU Mini M and E5 Plus do; DS_KMS_TURN=90|270 overrides), then the rotation asked for on top of it, as
+    // it is on any other panel (spruce's tate DS_ROTATE=270 included). Pointer events are SDL's: they come turned
+    // by SDL's part already, and map_point undoes ours (ptr_rot_).
+    int sdl_turn = 0;
+    if (const char* t = std::getenv("DS_KMS_TURN"); t && *t) sdl_turn = std::atoi(t);
+    if (sdl_turn != 90 && sdl_turn != 270) {
+      std::string cmdline;
+      if (std::FILE* f = std::fopen("/proc/cmdline", "r")) {
+        char buf[1024];
+        const size_t n = std::fread(buf, 1, sizeof buf, f);
+        cmdline.assign(buf, n);
+        std::fclose(f);
+      }
+      sdl_turn = frontend::sdl_panel_turn(cmdline);
+    }
     turned_ = true;
-    rot_ = (rot == 90 || rot == 270) ? rot : rot == 180 ? 90 : 270;
-    std::fprintf(stderr, "drm: SDL reports the %dx%d panel as %dx%d; scanning out at the panel's size, picture turned %d here\n", oh, ow, ow, oh, rot_);
+    ptr_rot_ = rot;
+    rot_ = (sdl_turn + rot) % 360;
+    std::fprintf(stderr, "drm: SDL reports the %dx%d panel as %dx%d (its turn %d); scanning out at the panel's size, picture turned %d here\n",
+                 oh, ow, ow, oh, sdl_turn, rot_);
   }
   out_ = std::move(dr);
   layout();
@@ -397,6 +417,7 @@ bool Display::source_targets(Target out[SCREENS]) {
   for (int i = 0; i < nviews_; ++i) {
     const View& v = views_[i];
     out[v.screen] = Target{src_side_[v.screen].data(), SCREEN_W, SCREEN_H, xrun_[v.screen].data(), seam_w_[v.screen].data(), nullptr, nullptr, false, xrun_plain_[v.screen].data()};
+    out[v.screen].plain = plain_screen(v.screen);
   }
   return true;
 }
@@ -483,7 +504,7 @@ bool Display::prepare_gpu(GpuFrame& f) {
   }
   FramePresenter::Params& p = f.params;
   out_size(p.lw, p.lh);
-  for (int i = 0; i < nviews_; ++i) f.v[i] = FramePresenter::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen)};
+  for (int i = 0; i < nviews_; ++i) f.v[i] = FramePresenter::View{views_[i].screen, views_[i].rect, views_[i].shown, !views_[i].direct, grid_on(views_[i].screen), plain_screen(views_[i].screen)};
   f.n = nviews_;
   p.rot = rot_; p.inset_alpha = inset_alpha_; p.linear = linear_;
   p.seam_blend = src_gpu_ ? 0 : seam_blend_;   // cells at source: their seams were the core's to draw
@@ -627,6 +648,16 @@ void Display::toggle_fullscreen() {
   margins_dirty_ = true;
 }
 
+void Display::set_small_screen_fx(bool on) {
+  if (on == small_fx_) return;
+  sync();
+  small_fx_ = on;
+  if (!win_ || disp_) return;   // before open(): its layout builds the tables
+  layout();
+  build_scale();
+  margins_dirty_ = true;
+}
+
 void Display::set_layout(const Layout& l) {
   sync();
   if (only_screen_ >= 0) return;
@@ -647,12 +678,13 @@ void Display::set_layout(const Layout& l) {
 }
 
 bool Display::map_point(int wx, int wy, int& screen, int& sx, int& sy) const {
-  // Pointer events arrive in presented pixels; inverse of rotate_out()'s mapping. (Not under turned_: SDL has
-  // turned them already.)
-  if (rot_ && scaled_ && !turned_) {
+  // Pointer events arrive in presented pixels; inverse of rotate_out()'s mapping. Under turned_ SDL has undone
+  // its own turn already, so only the one asked for on top of it is left.
+  const int prot = turned_ ? ptr_rot_ : rot_;
+  if (prot && scaled_) {
     const int lw = scaled_w_, lh = scaled_h_;
     int lx = wx, ly = wy;
-    switch (rot_) {
+    switch (prot) {
       case 270: lx = lw - 1 - wy; ly = wx; break;
       case 90:  lx = wy; ly = lh - 1 - wx; break;
       case 180: lx = lw - 1 - wx; ly = lh - 1 - wy; break;
@@ -747,7 +779,7 @@ void Display::build_source_scale() {
     int cell = 2;
     const u32 pw = static_cast<u32>(std::lround(v.rect.w * s)), ph = static_cast<u32>(std::lround(v.rect.h * s));
     // Shown smaller than the screen: flattening before a downscale is only blur.
-    src_chunky_[v.screen] = s > 0.0 && pw >= SCREEN_W && ph >= SCREEN_H;
+    src_chunky_[v.screen] = s > 0.0 && pw >= SCREEN_W && ph >= SCREEN_H && !plain_screen(v.screen);
     if (!src_chunky_[v.screen]) { if (disp_) disp_->set_view_cell(i, 1); continue; }
     if (chunky_cell_ != 0) {
       u32 P = 0;
@@ -826,9 +858,10 @@ void Display::build_scale() {
     // Chunky: the even pixel's run widens over the odd one's (left as a
     // zero-length run scale_row skips); destination coverage is unchanged.
     cells_[v.screen] = {};
-    src_chunky_[v.screen] = chunky_;
-    bool pair = chunky_;
-    if (chunky_) {
+    const bool fx_chunky = chunky_ && !plain_screen(v.screen);   // the plain screen: no cells, no pairs
+    src_chunky_[v.screen] = fx_chunky;
+    bool pair = fx_chunky;
+    if (fx_chunky) {
       // Cell of P panel pixels needs P to divide both dimensions, <=256 cells across.
       const u32 w = static_cast<u32>(v.rect.w), h = static_cast<u32>(v.rect.h);
       u32 P = 0;
@@ -958,6 +991,7 @@ void Display::targets(u32* px, u32 stride, int w, int h, Target out[SCREENS]) {
                              static_cast<u32>(y0), static_cast<u32>(std::max(y0, y1))};
     } else
       out[v.screen] = Target{side_[v.screen].data(), static_cast<u32>(v.rect.w), static_cast<u32>(v.rect.h), xrun_[v.screen].data(), seam_w_[v.screen].data(), lin_sx_[v.screen].data(), lin_wx_[v.screen].data(), grid_on(v.screen), xrun_plain_[v.screen].data()};
+    out[v.screen].plain = plain_screen(v.screen);
   }
 }
 

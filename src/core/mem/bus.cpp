@@ -340,10 +340,12 @@ void Bus::apply_wram(bool nwram, bool windows_only) {
     }
     PageTable& pt = nds_.cpu(c ? Cpu::ARM7 : Cpu::ARM9).page_table;
     u8** cells = wram_cells_[c];
+    u32 moved_lo = partial ? 0x04000000 : 0x03000000, moved_hi = partial ? 0x03000000 : 0x04000000;   // the cells that changed
     for (u32 a = lo; a < hi; a += CELL) {
       const u32 k = (a - 0x03000000) / CELL;
       u8* host = wram_cell_host(c, win, a);
       if (partial && cells[k] == host) continue;
+      if (partial) { moved_lo = std::min(moved_lo, a); moved_hi = std::max(moved_hi, a + CELL); }
       cells[k] = host;
       u8* pages[PAGES];
       for (u32 i = 0; i < PAGES; ++i) pages[i] = host ? host + (i << PAGE_SHIFT) : nullptr;
@@ -352,8 +354,8 @@ void Bus::apply_wram(bool nwram, bool windows_only) {
     wram_key_[c] = key;
     std::memcpy(wram_win_[c], win, sizeof win);
 #if DSPERATE_JIT
-    // WRAMCNT or a DSi window moved: code translated from 03xxxxxx may be other bytes now.
-    jit::remapped(nds_.cpu(c ? Cpu::ARM7 : Cpu::ARM9), 0x03000000, 0x03FFFFFF);
+    // WRAMCNT or a DSi window moved: code translated from the cells that moved may be other bytes now.
+    if (moved_lo < moved_hi) jit::remapped(nds_.cpu(c ? Cpu::ARM7 : Cpu::ARM9), moved_lo, moved_hi - 1);
 #endif
   }
 }
@@ -372,7 +374,7 @@ void Bus::update_nwram(bool windows_only) {
   std::memset(nwram_map_, 0, sizeof nwram_map_);
   if (nds_.dsi) {
     const io::DsiIo& d = nds_.io.dsi;
-    if (getenv("DS_DEBUG_MBK"))
+    if (static const bool debug = std::getenv("DS_DEBUG_MBK") != nullptr; debug)
       std::fprintf(stderr, "[nwram] rebuild scfg_ext %08x/%08x (bit25 a9=%d a7=%d) t=%llu\n",
                    d.scfg_ext[0], d.scfg_ext[1], (d.scfg_ext[0] >> 25) & 1, (d.scfg_ext[1] >> 25) & 1,
                    (unsigned long long)nds_.sched.now());
@@ -744,7 +746,7 @@ void Bus::io_write(Cpu cpu, u32 addr, u32 width, u32 v) {
   case 0x04:
     // ARM9 word stores to GXFIFO/direct command ports: straight to the
     // geometry engine instead of through io_unowned's slower path.
-    if (width == 32 && cpu == Cpu::ARM9 && addr - 0x04000400 < 0x1CC && !io::Io::census_on()) { nds_.gpu3d.gx_port_write(addr, v); return; }
+    if (width == 32 && cpu == Cpu::ARM9 && addr - 0x04000400 < 0x1CC && !io::Io::census_on()) { nds_.io.cart_poll_reset(); nds_.gpu3d.gx_port_write(addr, v); return; }
     nds_.io.write(cpu, addr, width, v); return;
   case 0x05: nds_.gpu.palette_store(cpu, addr, width, v); return;
   case 0x07: nds_.gpu.oam_store(cpu, addr, width, v); return;

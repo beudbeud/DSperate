@@ -135,12 +135,27 @@ void code_write_hook(u8* host, u32 len) {
 
 constexpr size_t PARKED_PER_KEY = 4;
 
-void kill_block(JitCpu& jc, Block* b) {
+// A block joins or leaves the live counts: live_64k once where it starts and, if that is another 64 KB, once
+// where it ends; its piece's where it starts.
+void count_live(JitCpu& jc, const Block* b, bool add) {
+  const u32 first = key_pc(b->key) >> 16;
+  const u32 last = static_cast<u32>((static_cast<u64>(key_pc(b->key)) + b->guest_len - 1) >> 16) & 0xFFFF;
+  for (u32 k = first;; k = last) {
+    u32& n = jc.live_64k[k];
+    if (add) ++n; else if (n) --n;
+    if (k == last) break;
+  }
+  if (add) ++jc.pieces[key_pc(b->key) >> JitCpu::PIECE_SHIFT].live;
+  else if (const auto it = jc.pieces.find(key_pc(b->key) >> JitCpu::PIECE_SHIFT); it != jc.pieces.end() && it->second.live) --it->second.live;
+}
+
+// `park` false: the caller drops every parked translation next (a retime), so this one need not be kept.
+void kill_block(JitCpu& jc, Block* b, bool park = true) {
   if (b->dead) return;
   b->dead = true;
   // Linked callers now land in the dispatcher, which revives or retranslates.
   std::memcpy(b->entry_words, b->entry, backend::ENTRY_PATCH);
-  {
+  if (park) {
     std::vector<Block*>& v = jc.parked[b->key];
     if (v.size() >= PARKED_PER_KEY) v.erase(v.begin());
     v.push_back(b);
@@ -150,7 +165,7 @@ void kill_block(JitCpu& jc, Block* b) {
   const u32 idx = (b->key >> 1) & (LUT_SIZE - 1);
   if (static_cast<u32>(jc.lut[idx]) == b->key) jc.lut[idx] = LUT_EMPTY_KEY;
   jc.blocks.erase(b->key);
-  if (u32& n = jc.region_live[key_pc(b->key) >> 24]) --n;
+  count_live(jc, b, false);
   g_rt.stats.blocks_invalidated++;
 }
 
@@ -171,9 +186,11 @@ void reset_arena() {
   for (JitCpu& jc : r.cpus) {
     for (Block* b : jc.all_blocks) if (!b->pooled) delete b;
     jc.all_blocks.clear();
+    jc.pieces.clear();
     jc.blocks.clear();
     jc.parked.clear();
-    std::memset(jc.region_live, 0, sizeof jc.region_live);
+    std::memset(jc.live_64k, 0, sizeof jc.live_64k);
+    jc.longest_block = 0;
     if (jc.lut) for (u32 i = 0; i < LUT_SIZE; ++i) jc.lut[i] = LUT_EMPTY_KEY;
   }
   for (auto& kv : r.code_pages) set_code_tag(kv.first, false);
@@ -196,13 +213,31 @@ void on_timing_changed(CpuContext& cpu) {
   if (churn::on()) { static bool reg = (std::atexit(churn::report), true); (void)reg; }
   u64 killed = 0;
   if (t.retime_pending()) {
-    for (Block* b : jc.all_blocks) {
+    // Two passes, each fetching ahead: with tens of thousands of blocks every one is a cache miss, twice
+    // (its flags, its dependencies), and a kill is three more (its code, its LUT slot, the block map).
+    // The frame in which the DSi menu hands over to a title does this three times and kills ~15k blocks.
+    static std::vector<Block*> victims;
+    victims.clear();
+    Block* const* all = jc.all_blocks.data();
+    const size_t n = jc.all_blocks.size();
+    constexpr size_t AHEAD = 8;
+    for (size_t k = 0; k < n; ++k) {
+      if (k + AHEAD < n) { __builtin_prefetch(&all[k + AHEAD]->dead); __builtin_prefetch(&all[k + AHEAD]->ndep); }
+      Block* b = all[k];
       if (b->dead) continue;
       bool hit = b->dep_overflow;
       for (u32 i = 0; i < b->ndep && !hit; ++i) hit = (t.retime_flag(b->dep_page[i]) & b->dep_kind[i]) != 0;
-      if (!hit) continue;
+      if (hit) victims.push_back(b);
+    }
+    for (size_t k = 0; k < victims.size(); ++k) {
+      if (k + AHEAD < victims.size()) {
+        const Block* nb = victims[k + AHEAD];
+        __builtin_prefetch(nb->entry, 1);
+        __builtin_prefetch(&jc.lut[(nb->key >> 1) & (LUT_SIZE - 1)], 1);
+      }
+      Block* b = victims[k];
       remove_from_page_lists(b);
-      kill_block(jc, b);
+      kill_block(jc, b, false);
       ++killed;
     }
   }
@@ -263,6 +298,7 @@ static void perf_map_stubs(const Runtime& r) {
     const std::string pre = c == 0 ? "jit_stub9_" : "jit_stub7_";
     add(jc.dispatch, (pre + "dispatch").c_str()); add(jc.link, (pre + "link").c_str()); add(jc.fallback, (pre + "fallback").c_str());
     add(jc.branch_indirect, (pre + "branch_indirect").c_str()); add(jc.branch_indirect_cdi, (pre + "branch_indirect_cdi").c_str());
+    add(jc.branch_indirect_poll, (pre + "branch_indirect_poll").c_str());
   }
   std::sort(v.begin(), v.end());
   for (size_t i = 0; i < v.size(); ++i) {
@@ -319,7 +355,7 @@ static void register_block(JitCpu& jc, Block* b) {
     v.add(b, lo, hi);
   }
   jc.blocks[b->key] = b;
-  ++jc.region_live[pc >> 24];
+  count_live(jc, b, true);
   lut_insert(jc, b);
 }
 
@@ -367,6 +403,12 @@ static void install(JitCpu& jc, Block* b) {
   if (b->span_hi) b->span_hash = span_hash(jc, b);
   register_block(jc, b);
   jc.all_blocks.push_back(b);
+  {
+    JitCpu::Piece& piece = jc.pieces[key_pc(b->key) >> JitCpu::PIECE_SHIFT];
+    piece.blocks.push_back(b);
+    piece.reach = std::max(piece.reach, static_cast<u32>(std::min<u64>(static_cast<u64>(key_pc(b->key)) + b->guest_len - 1, 0xFFFFFFFFu)));
+  }
+  jc.longest_block = std::max(jc.longest_block, b->guest_len);
   r.blocks_live++;
   r.stats.blocks_translated++;
   r.stats.code_bytes += b->size;
@@ -493,7 +535,7 @@ static void invalidate_blocks(const u8* host_page, std::vector<Block*> victims) 
 }
 
 void invalidate_cpu(JitCpu& jc) {
-  for (Block* b : jc.all_blocks) if (!b->dead) { remove_from_page_lists(b); kill_block(jc, b); }
+  for (Block* b : jc.all_blocks) if (!b->dead) { remove_from_page_lists(b); kill_block(jc, b, false); }
   jc.blocks.clear();
   jc.parked.clear();
   if (jc.ctx) jc.ctx->hot.alerts |= ALERT_INVALIDATED;
@@ -843,10 +885,19 @@ void remapped(CpuContext& cpu, u32 lo, u32 hi) {
   if (!cpu.jit) return;
   JitCpu& jc = *static_cast<JitCpu*>(cpu.jit);
   u32 any = 0;
-  for (u32 r = lo >> 24; r <= hi >> 24; ++r) any |= jc.region_live[r];
+  for (u32 k = lo >> 16; k <= hi >> 16; ++k) any |= jc.live_64k[k];
   if (!any) return;
   u64 killed = 0;
-  for (Block* b : jc.all_blocks) {
+  // Only the blocks of the 16 KB pieces in the range, and of those below it that have a block reaching into lo:
+  // walking all_blocks cost ~2 ms a call with ~12k blocks, and Pokemon White remaps VRAM often enough in a battle
+  // for that to put frames over budget (v4.0.1). Lists by pc >> 24 were not fine enough either: the DSi menu moves
+  // a WRAM window ~70 times a frame while it starts a title, and walking every 02xxxxxx and 03xxxxxx block for
+  // each made those frames 140-230 ms on the RG DS Plus.
+  for (u32 k = (lo > jc.longest_block ? lo - jc.longest_block : 0) >> JitCpu::PIECE_SHIFT; k <= hi >> JitCpu::PIECE_SHIFT; ++k) {
+  if (!jc.live_64k[k >> (16 - JitCpu::PIECE_SHIFT)]) continue;   // a block is counted where it starts
+  const auto it = jc.pieces.find(k);
+  if (it == jc.pieces.end() || !it->second.live || it->second.reach < lo) continue;
+  for (Block* b : it->second.blocks) {
     if (b->dead) continue;
     const u32 pc = key_pc(b->key);
     if (pc > hi || static_cast<u64>(pc) + b->guest_len - 1 < lo) continue;
@@ -857,6 +908,7 @@ void remapped(CpuContext& cpu, u32 lo, u32 hi) {
     remove_from_page_lists(b);
     kill_block(jc, b);   // parked: it comes back only if the address shows its bytes again
     ++killed;
+  }
   }
   if (killed) jc.ctx->hot.alerts |= ALERT_INVALIDATED;
 }

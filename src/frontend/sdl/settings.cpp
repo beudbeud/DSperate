@@ -122,6 +122,8 @@ const Setting kEmuSettings[] = {
   number("audio.buffer_size", N_("AUDIO BUFFER"), 20, 200, 10, "auto", FlagLive, Dep::None,
          N_("SOUND HELD AHEAD. LOWER IS LESS DELAY, LESS SLACK BEFORE A LATE FRAME IS HEARD"),
          "auto", N_("AUTO"), " MS"),
+  boolean("audio.hw_filter", N_("HARDWARE AUDIO"), "false", FlagLive, Dep::None,
+          N_("THE CONSOLE'S OWN OUTPUT: A DS'S 10 BITS AND NOTHING ABOVE 16 KHZ, OR A DSI'S CODEC FILTER")),
   // Turbo is not the console's speed: the host warns once a session when it is picked here (main.cpp).
   pick("emu.timing", N_("CPU TIMING"), kTiming, 3, "fast", FlagRestart, Dep::None,
        N_("EXACT IS THE CONSOLE'S, AND SLOWER TO RUN. TURBO GIVES GAMES MORE CPU: SMOOTHER, MAY BREAK SOME")),
@@ -223,6 +225,8 @@ const Setting kLayoutSettings[] = {
           N_("THE SMALLER SCREEN'S SIZE. AUTO FITS WHOLE PIXELS"), "auto", N_("AUTO")),
   percent("video.dominant_threshold", N_("DOMINANT THRESHOLD"), 10, 99, 5, "0.25", FlagDeferred, Dep::DominantThreshold,
           N_("THE SMALLEST SECONDARY AUTO WILL ACCEPT")),
+  boolean("video.small_screen_fx", N_("SMALL SCREEN FX"), "true", FlagDeferred, Dep::SmallScreen,
+          N_("VISUAL FX ON THE SMALLER SCREEN TOO. OFF SHOWS IT PLAIN: NO GRID, SEAMS, BILINEAR OR CHUNKY")),
   check("video.layout_cycle.vertical", N_("CYCLE VERTICAL"), "true", FlagLive, Dep::OneWindow,
         N_("THE LAYOUT HOTKEYS STEP THROUGH THE TICKED LAYOUTS")),
   check("video.layout_cycle.horizontal", N_("CYCLE HORIZONTAL"), "true", FlagLive, Dep::OneWindow,

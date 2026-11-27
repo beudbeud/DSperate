@@ -262,10 +262,29 @@ public:
   SpiFirmware spi_fw; SpiTouch spi_tsc; SpiPower spi_pm;
   const s16* mic_ = nullptr; size_t mic_count_ = 0; u64 mic_start_ = 0;
   mutable bool mic_used_ = false;
+  // The SDK's microphone auto-sampling interrupts the ARM7 at the sample rate (7.8 kHz in the DS Zeldas, 130
+  // interrupts a frame) whether or not anything is listening. An ARM7 timer whose handler has read the AUX input
+  // after each of its last MIC_IDLE_STREAK delivered interrupts has only one in MIC_IDLE_EVERY delivered while no
+  // input arrives (no samples from the frontend); the first frame with input ends it. Fast and turbo timing, DS
+  // mode; DS_MIC_IDLE=0 turns it off, DS_MIC_IDLE=N (2-255) sets the ratio. Not saved with a state.
+  static constexpr u32 MIC_IDLE_STREAK = 64, MIC_IDLE_EVERY = 16;
+  mutable u64 mic_conv_at_ = 0;                 // when the AUX input was last read
+  mutable bool mic_conv_new_ = false;
+  u64 mic_tim_irq_at_[4] = {};                  // each ARM7 timer's last delivered interrupt
+  u8  mic_tim_streak_[4] = {}, mic_tim_skip_[4] = {};
+  bool mic_idle_gate(int idx);                  // true: deliver this overflow's interrupt
   Rtc rtc;
   Cart cart;
   u16 arm7_bios_prot = 0;    // reads below this from outside the BIOS return garbage
   bool cart_drq() { cart_catch_up(); return (cart.romctrl & 0x00800000) != 0; }
+  // ROMCTRL polled for the next word's DRQ (a CPU copy loop spins on it between words, a dozen reads a word):
+  // after this many back-to-back reads that find none, the rest of the wait for the word is charged to the
+  // polling CPU's budget instead of spun, as the SPI busy wait is. Any other register access by either CPU
+  // starts the count again. DS mode only; DS_IDLE_SKIP=0 or DS_CART_POLL_SKIP=0 disables.
+  static constexpr u32 CART_POLL_STREAK = 3;
+  u32 cart_poll_streak_ = 0;
+  u32 romctrl_read_poll(Cpu cpu);
+  void cart_poll_reset() { cart_poll_streak_ = 0; }
   // Hot: every ROMCTRL/ROMDATA read.
   void cart_catch_up() { if (cart.transfer_pos < cart.transfer_len) cart_catch_up_slow(); }
   // ARM7 0x04800000-0x0480FFFF, gated on POWCNT2 bit 1.
